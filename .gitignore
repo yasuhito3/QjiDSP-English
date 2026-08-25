@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Qji runtime output / personal settings (excluded from distribution)
+*.log
+*.bak_before_dsp_*
+qji.py.bak_*
+/camilladsp_test/spatial_final.yml
+music_mood_db.json
+*.db
+
+# User-specific settings / credentials
+.config/qji_*.json
+qji_*_favorites.json
+qji_*_playlists.json
+qji_*_auth.json
+
+# Install-time log
+qjidsp_install_debug.log
+
+# OS / editor artifacts
+.DS_Store
+*.swp
+.vscode/
+.idea/

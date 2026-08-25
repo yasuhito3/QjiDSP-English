@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=QjiDSP Installer
+GenericName=QjiDSP Installer
+Comment=Adds 3D spatial audio (CamillaDSP) to Qji
+Exec=bash install_qjidsp.sh
+Icon=audio-x-generic
+Terminal=true
+StartupNotify=false
+Categories=System;Utility;
+Keywords=Qji;QjiDSP;CamillaDSP;install;music;

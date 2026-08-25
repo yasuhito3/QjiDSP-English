@@ -1,0 +1,18 @@
+# Python libraries required for the Qji app to run.
+# install_qjidsp.sh installs these automatically, but for manual setup use:
+#   pip install -r requirements.txt --break-system-packages
+
+mutagen          # reads music file metadata
+soundfile        # audio file I/O
+scipy            # signal processing
+yt-dlp           # YouTube Music playback (required)
+ytmusicapi       # YouTube Music library access (optional, recommended)
+requests         # HTTP communication for Qobuz / SoundCloud / YouTube Music
+
+# CamillaDSP's Python bindings (not on PyPI, installed via git):
+# pip install git+https://github.com/HEnquist/pycamilladsp.git --break-system-packages
+
+# The following are only needed for the optional voice control feature.
+# Skip them if you don't use it:
+# vosk
+# sounddevice

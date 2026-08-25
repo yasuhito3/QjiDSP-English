@@ -1,0 +1,188 @@
+devices:
+  samplerate: 48000
+  chunksize: 1024
+  capture:
+    type: Alsa
+    channels: 2
+    device: "hw:CARD=Loopback,DEV=1"
+    format: S32_LE
+  playback:
+    type: Alsa
+    channels: 2
+    device: "plughw:CARD=Amanero,DEV=0"
+    format: S32_LE
+
+filters:
+  real_hall_L:
+    type: Conv
+    parameters:
+      type: Wav
+      filename: "/home/yasuhito/camilladsp_test/Musikvereinsaal_48k_tail.wav"
+      channel: 0
+  real_hall_R:
+    type: Conv
+    parameters:
+      type: Wav
+      filename: "/home/yasuhito/camilladsp_test/Musikvereinsaal_48k_tail.wav"
+      channel: 1
+  wet_gain_L:
+    type: Gain
+    parameters:
+      gain: -36.53
+      scale: dB
+  wet_gain_R:
+    type: Gain
+    parameters:
+      gain: -36.53
+      scale: dB
+  delay_R:
+    type: Delay
+    parameters:
+      delay: 35
+      unit: ms
+      subsample: false
+  low_bass_harmonic:
+    type: Biquad
+    parameters:
+      type: Peaking
+      freq: 100
+      q: 1.0
+      gain: 0.4
+  high_shelf:
+    type: Biquad
+    parameters:
+      type: Highshelf
+      freq: 5500
+      slope: 1.0
+      gain: -2.5
+  safety_limiter:
+    type: Limiter
+    parameters:
+      clip_limit: -0.5
+      soft_clip: true
+  cross_delay_L:
+    type: Delay
+    parameters:
+      delay: 0.35
+      unit: ms
+      subsample: true
+  cross_delay_R:
+    type: Delay
+    parameters:
+      delay: 0.35
+      unit: ms
+      subsample: true
+  cross_lp_L:
+    type: BiquadCombo
+    parameters:
+      type: LinkwitzRileyLowpass
+      freq: 1100
+      order: 4
+  cross_lp_R:
+    type: BiquadCombo
+    parameters:
+      type: LinkwitzRileyLowpass
+      freq: 1100
+      order: 4
+
+mixers:
+  split_2to4:
+    channels:
+      in: 2
+      out: 4
+    mapping:
+      - dest: 0
+        sources:
+          - channel: 0
+      - dest: 1
+        sources:
+          - channel: 1
+      - dest: 2
+        sources:
+          - channel: 0
+      - dest: 3
+        sources:
+          - channel: 1
+
+  mix_4to2:
+    channels:
+      in: 4
+      out: 2
+    mapping:
+      - dest: 0
+        sources:
+          - channel: 0
+          - channel: 2
+      - dest: 1
+        sources:
+          - channel: 1
+          - channel: 3
+
+  cross_split:
+    channels:
+      in: 2
+      out: 4
+    mapping:
+      - dest: 0
+        sources:
+          - channel: 0
+      - dest: 1
+        sources:
+          - channel: 1
+      - dest: 2
+        sources:
+          - channel: 0
+      - dest: 3
+        sources:
+          - channel: 1
+
+  cross_final_mix:
+    channels:
+      in: 4
+      out: 2
+    mapping:
+      - dest: 0
+        sources:
+          - channel: 0
+            gain: 0
+          - channel: 3
+            gain: -11.0
+            scale: dB
+      - dest: 1
+        sources:
+          - channel: 1
+            gain: 0
+          - channel: 2
+            gain: -11.0
+            scale: dB
+
+pipeline:
+  - type: Mixer
+    name: split_2to4
+  - type: Filter
+    channels: [2]
+    names: [real_hall_L, wet_gain_L]
+  - type: Filter
+    channels: [3]
+    names: [real_hall_R, wet_gain_R, delay_R]
+  - type: Mixer
+    name: mix_4to2
+
+  - type: Mixer
+    name: cross_split
+  - type: Filter
+    channels: [2]
+    names: [cross_delay_L, cross_lp_L]
+  - type: Filter
+    channels: [3]
+    names: [cross_delay_R, cross_lp_R]
+  - type: Mixer
+    name: cross_final_mix
+
+  - type: Filter
+    channels: [0]
+    names: [low_bass_harmonic, high_shelf, safety_limiter]
+  - type: Filter
+    channels: [1]
+    names: [low_bass_harmonic, high_shelf, safety_limiter]
+

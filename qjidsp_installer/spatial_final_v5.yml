@@ -1,0 +1,160 @@
+devices:
+  samplerate: 48000
+  chunksize: 4096   # 2014 MacBook Air向け: CPUに余裕を持たせるため1024→4096に拡大(遅延は約85msに増加、音楽鑑賞では体感なし)
+  capture:
+    type: Alsa
+    channels: 2
+    device: "hw:CARD=Loopback,DEV=1"
+    format: S32_LE
+  playback:
+    type: Alsa
+    channels: 2
+    device: "plughw:CARD=Amanero,DEV=0"
+    format: S32_LE
+
+filters:
+  real_hall_L:
+    type: Conv
+    parameters:
+      type: Wav
+      filename: "/home/yasuhito/camilladsp_test/Musikvereinsaal_48k_tail.wav"
+      channel: 0
+  real_hall_R:
+    type: Conv
+    parameters:
+      type: Wav
+      filename: "/home/yasuhito/camilladsp_test/Musikvereinsaal_48k_tail.wav"
+      channel: 1
+  wet_gain_L:
+    type: Gain
+    parameters:
+      gain: -36.53
+      scale: dB
+  wet_gain_R:
+    type: Gain
+    parameters:
+      gain: -36.53
+      scale: dB
+  delay_R:
+    type: Delay
+    parameters:
+      delay: 35
+      unit: ms
+      subsample: false
+
+  low_bass_harmonic:
+    type: Biquad
+    parameters:
+      type: Peaking
+      freq: 100
+      q: 1.5
+      gain: 0.8
+      
+  mid_high_resonance:
+    type: Biquad
+    parameters:
+      type: Peaking
+      freq: 2500     # 尺八などの管楽器が共鳴しやすい中高域
+      q: 8.0        # Q値を「8.0」という非常に鋭い値に設定（ピンポイントに絞る）
+      gain: 1.5      # 鋭く突くため、1.5dBでも「ビーン」という響きが乗りやすくなります
+
+  violin_resonance_1:
+    type: Biquad
+    parameters:
+      type: Peaking
+      freq: 2500
+      q: 12.0       # 極めて鋭く突く（不要なチリチリ音を巻き込まない）
+      gain: 2
+  violin_resonance_2:
+    type: Biquad
+    parameters:
+      type: Peaking
+      freq: 3500
+      q: 15.0
+      gain: 1.5
+  violin_resonance_3:
+    type: Biquad
+    parameters:
+      type: Peaking
+      freq: 5000
+      q: 12.0
+      gain: 1
+
+  high_shelf:
+    type: Biquad
+    parameters:
+      type: Highshelf
+      freq: 6000
+      slope: 1.0
+      gain: -1.5
+  safety_limiter:
+    type: Limiter
+    parameters:
+      clip_limit: -0.5
+      soft_clip: true
+
+mixers:
+  split_2to4:
+    channels:
+      in: 2
+      out: 4
+    mapping:
+      - dest: 0
+        sources:
+          - channel: 0
+            gain: 0
+            inverted: false
+      - dest: 1
+        sources:
+          - channel: 1
+            gain: 0
+            inverted: false
+      - dest: 2
+        sources:
+          - channel: 0
+            gain: 0
+            inverted: false
+      - dest: 3
+        sources:
+          - channel: 1
+            gain: 0
+            inverted: false
+
+  mix_4to2:
+    channels:
+      in: 4
+      out: 2
+    mapping:
+      - dest: 0
+        sources:
+          - channel: 0
+            gain: 0
+            inverted: false
+          - channel: 2
+            gain: 0
+            inverted: false
+      - dest: 1
+        sources:
+          - channel: 1
+            gain: 0
+            inverted: false
+          - channel: 3
+            gain: 0
+            inverted: false
+
+pipeline:
+  - type: Mixer
+    name: split_2to4
+  - type: Filter
+    channels: [2]
+    names: [real_hall_L, wet_gain_L]
+  - type: Filter
+    channels: [3]
+    names: [real_hall_R, wet_gain_R, delay_R]
+  - type: Mixer
+    name: mix_4to2
+  - type: Filter
+    channels: [0, 1]
+    # high_shelf の手前に mid_high_resonance を挿入
+    #names: [low_bass_harmonic, mid_high_resonance, high_shelf, safety_limiter]
+    names: [low_bass_harmonic, mid_high_resonance, violin_resonance_1, violin_resonance_2, violin_resonance_3, high_shelf, safety_limiter]

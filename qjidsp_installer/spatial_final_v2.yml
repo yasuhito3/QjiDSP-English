@@ -1,0 +1,227 @@
+devices:
+  samplerate: 48000
+  chunksize: 8192
+  capture:
+    type: Alsa
+    channels: 2
+    device: "hw:CARD=Loopback,DEV=1"
+    format: S32_LE
+  playback:
+    type: Alsa
+    channels: 2
+    device: "plughw:CARD=Amanero,DEV=0"
+    format: S32_LE
+
+filters:
+  real_hall_L:
+    type: Conv
+    parameters:
+      type: Wav
+      filename: "/home/yasuhito/camilladsp_test/Musikvereinsaal_48k_tail.wav"
+      channel: 0
+  real_hall_R:
+    type: Conv
+    parameters:
+      type: Wav
+      filename: "/home/yasuhito/camilladsp_test/Musikvereinsaal_48k_tail.wav"
+      channel: 1
+  wet_gain_L:
+    type: Gain
+    parameters:
+      gain: -40
+      scale: dB
+  wet_gain_R:
+    type: Gain
+    parameters:
+      gain: -40
+      scale: dB
+  delay_R:
+    type: Delay
+    parameters:
+      delay: 35
+      unit: ms
+      subsample: false
+  body:
+    type: Biquad
+    parameters:
+      type: Peaking
+      freq: 180
+      q: 0.9
+      gain: 2.2
+  presence:
+    type: Biquad
+    parameters:
+      type: Peaking
+      freq: 2800
+      q: 1.2
+      gain: 1.6
+  presence_detail:
+    type: Biquad
+    parameters:
+      type: Peaking
+      freq: 2400
+      q: 1.5
+      gain: 0.25
+  violin_warmth:
+    type: Biquad
+    parameters:
+      type: Peaking
+      freq: 720
+      q: 0.8
+      gain: 0.45
+  string_body:
+    type: Biquad
+    parameters:
+      type: Peaking
+      freq: 520
+      q: 0.9
+      gain: 0.25
+  contrabass_body:
+    type: Biquad
+    parameters:
+      type: Peaking
+      freq: 105
+      q: 0.9
+      gain: 0.35
+  contrabass_pluck:
+    type: Biquad
+    parameters:
+      type: Peaking
+      freq: 1900
+      q: 1.0
+      gain: 0.5
+  contrabass_attack:
+    type: Biquad
+    parameters:
+      type: Peaking
+      freq: 2700
+      q: 1.2
+      gain: 0.20
+  pluck_clarity:
+    type: Biquad
+    parameters:
+      type: Peaking
+      freq: 420
+      q: 0.9
+      gain: -0.20
+  body_brass:
+    type: Biquad
+    parameters:
+      type: Peaking
+      freq: 1000
+      q: 0.9
+      gain: 1.2
+  presence_violin:
+    type: Biquad
+    parameters:
+      type: Peaking
+      freq: 3600
+      q: 1.3
+      gain: 0.6
+  air:
+    type: Biquad
+    parameters:
+      type: Peaking
+      freq: 10000
+      q: 0.8
+      gain: 1.2
+  high_shelf:
+    type: Biquad
+    parameters:
+      type: Highshelf
+      freq: 5000
+      slope: 1.0
+      gain: -4.0
+  high_air:
+    type: Biquad
+    parameters:
+      type: Highshelf
+      freq: 8200
+      slope: 0.7
+      gain: 0.4
+  safety_limiter:
+    type: Limiter
+    parameters:
+      clip_limit: -0.5
+      soft_clip: true
+
+mixers:
+  split_2to4:
+    channels:
+      in: 2
+      out: 4
+    mapping:
+      - dest: 0
+        sources:
+          - channel: 0
+            gain: 0
+            inverted: false
+      - dest: 1
+        sources:
+          - channel: 1
+            gain: 0
+            inverted: false
+      - dest: 2
+        sources:
+          - channel: 0
+            gain: 0
+            inverted: false
+      - dest: 3
+        sources:
+          - channel: 1
+            gain: 0
+            inverted: false
+
+  mix_4to2:
+    channels:
+      in: 4
+      out: 2
+    mapping:
+      - dest: 0
+        sources:
+          - channel: 0
+            gain: 0
+            inverted: false
+          - channel: 2
+            gain: 0
+            inverted: false
+      - dest: 1
+        sources:
+          - channel: 1
+            gain: 0
+            inverted: false
+          - channel: 3
+            gain: 0
+            inverted: false
+
+pipeline:
+  - type: Mixer
+    name: split_2to4
+  - type: Filter
+    channels: [2]
+    names: [real_hall_L, wet_gain_L]
+  - type: Filter
+    channels: [3]
+    names: [real_hall_R, wet_gain_R, delay_R]
+  - type: Mixer
+    name: mix_4to2
+  - type: Filter
+    channels: [0, 1]
+    names:
+       [
+        body,
+        string_body,
+        violin_warmth,
+        contrabass_body,
+        contrabass_pluck,
+        contrabass_attack,
+        pluck_clarity,
+        body_brass,
+        presence,
+        presence_detail,
+        presence_violin,
+        air,
+        #high_shelf,
+        high_air,
+        safety_limiter
+       ] 
