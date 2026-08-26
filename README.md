@@ -121,8 +121,12 @@ Get a model from [alphacep/vosk-api](https://alphacephei.com/vosk/models) or sim
 
 ### Qji Peak Monitor (stereo VU meter)
 
-⚠️ **Not included in this installer (`install_qjidsp.sh`).** Planned as a separate optional repository on GitHub.
-If you need it, please use that repository separately (link to be added once published).
+⚠️ **Not included in this installer (`install_qjidsp.sh`).** It's a separate, optional repository:
+👉 **[Qji Peak Monitor](https://github.com/yasuhito3/Qji-peak-monitor)**
+
+A standalone real-time stereo peak/VU meter for Qji's final output stage, with a display-delay
+feature to compensate for downstream buffering (handy when listening through QjiDSP). See that
+repository's README for installation and usage instructions.
 
 ---
 
