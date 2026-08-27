@@ -995,6 +995,15 @@ def get_now_playing_control_html():
     line-height: 1.5; word-break: break-word; }
   .meta-label { color: #666; font-size: 0.75rem; margin-right: 4px; }
   #track-num { font-size: 0.78rem; color: #555; margin-top: 14px; }
+  #preset-badge {
+    display: none; align-items: center; justify-content: center; gap: 8px;
+    width: 100%; max-width: 360px; margin: 4px 0 20px;
+    padding: 9px 14px; border-radius: 20px;
+    background: #16202e; border: 1px solid #2a3f5a;
+    color: #8fc3f7; font-size: 0.85rem; font-weight: 600;
+    letter-spacing: 0.02em;
+  }
+  #preset-badge .preset-cap { color: #567; font-weight: 400; font-size: 0.75rem; }
   #status-dot {
     display: inline-block; width: 8px; height: 8px;
     background: #1db954; border-radius: 50%; margin-right: 6px;
@@ -1043,6 +1052,7 @@ def get_now_playing_control_html():
 <body>
 <div id="waiting"><div class="icon">🎵</div><div>再生待機中...</div></div>
 <div id="jacket" style="display:none"><div class="no-image">🎵</div></div>
+<div id="preset-badge"><span class="preset-cap">音場</span><span id="preset-label">—</span></div>
 <div id="info" style="display:none">
   <div id="title">—</div>
   <div class="meta-row"><span class="meta-label">作曲家</span><span id="composer">—</span></div>
@@ -1072,6 +1082,13 @@ def get_now_playing_control_html():
     document.getElementById('jacket').style.display = hasTrack ? 'block' : 'none';
     document.getElementById('info').style.display = hasTrack ? 'block' : 'none';
     document.getElementById('controls').style.display = 'flex';  /* 常時表示 */
+    const badge = document.getElementById('preset-badge');
+    if (data.preset_label) {
+      badge.style.display = 'flex';
+      document.getElementById('preset-label').textContent = data.preset_label;
+    } else {
+      badge.style.display = 'none';
+    }
     if (!hasTrack) return;
 
     document.getElementById('title').textContent = data.title || '—';
@@ -1228,6 +1245,9 @@ def start_now_playing_server():
                             'has_image':    has_image,
                             'image_ts':     str(int(os.path.getmtime(img_path) * 1000))
                                              if has_image else '0',
+                            'preset':       current_filter_preset,
+                            'preset_label': FILTER_PRESET_LABELS.get(
+                                                current_filter_preset, current_filter_preset),
                         }
                         if payload != last_sent:
                             line = 'data: ' + json.dumps(payload, ensure_ascii=False) + '\n\n'
@@ -1765,6 +1785,48 @@ def measure_track_loudness(file_path, target_i='-16', target_tp='-2.0', target_l
     return measured
 
 
+def _format_linear_loudnorm(measured, target_i='-16', target_tp='-2.0', target_lra='11'):
+    """実測値(measure_track_loudness の戻り値)から2パス(linear=true)の
+    loudnormフィルター文字列を組み立てる。末尾にカンマを含む。"""
+    return (
+        f'loudnorm=I={target_i}:TP={target_tp}:LRA={target_lra}:'
+        f"measured_I={measured['measured_I']}:"
+        f"measured_TP={measured['measured_TP']}:"
+        f"measured_LRA={measured['measured_LRA']}:"
+        f"measured_thresh={measured['measured_thresh']}:"
+        f"offset={measured['offset']}:linear=true,"
+    )
+
+
+def _peek_cached_loudness(file_path, target_i='-16', target_tp='-2.0', target_lra='11'):
+    """ffmpegを一切呼ばず、キャッシュに実測値が既にあるかどうかだけを確認する。
+    os.stat()＋辞書参照のみなので実質コスト0。再生開始を絶対にブロックしない
+    ためにこれを使い、無ければ従来の1パス方式にフォールバックする。"""
+    if not file_path:
+        return None
+    try:
+        st = os.stat(file_path)
+        cache_key = f"{file_path}|{st.st_mtime}|{st.st_size}|{target_i}|{target_tp}|{target_lra}"
+    except OSError:
+        return None
+    with _loudness_cache_lock:
+        cache = _load_loudness_cache()
+        return cache.get(cache_key)
+
+
+def _prefetch_loudness_async(file_path, target_i='-16', target_tp='-2.0', target_lra='11'):
+    """バックグラウンドスレッドで実測してキャッシュへ書き込む（再生は一切ブロックしない）。
+    次に再生される曲の"先読み"や、未実測だった曲の"次回のための実測"に使う。"""
+    if not file_path:
+        return
+    def _worker():
+        try:
+            measure_track_loudness(file_path, target_i, target_tp, target_lra)
+        except Exception:
+            pass
+    threading.Thread(target=_worker, daemon=True, name='loudness-prefetch').start()
+
+
 def build_loudnorm_filter(file_path=None, target_i='-16', target_tp='-2.0', target_lra='11'):
     """
     音量一定化フィルター文字列を構築する。
@@ -1772,19 +1834,15 @@ def build_loudnorm_filter(file_path=None, target_i='-16', target_tp='-2.0', targ
     正確なラウドネス正規化を行う（曲ごとの音量差を実際に揃える）。
     file_path が無い(ラジオ/AirPlay等のライブストリーム)、または実測失敗時は
     従来通りのリアルタイム1パス(dynamic)方式にフォールバックする。
+    ★ 注意: 実測がキャッシュに無い場合ここでffmpegの解析パスを同期実行するため、
+    再生開始をブロックしたくない箇所（通常/ランダム再生）では使わないこと。
+    そちらは _peek_cached_loudness + _prefetch_loudness_async を使う。
     末尾にカンマを含む形式で返す（空文字なら未使用）。
     """
     if file_path:
         measured = measure_track_loudness(file_path, target_i, target_tp, target_lra)
         if measured:
-            return (
-                f'loudnorm=I={target_i}:TP={target_tp}:LRA={target_lra}:'
-                f"measured_I={measured['measured_I']}:"
-                f"measured_TP={measured['measured_TP']}:"
-                f"measured_LRA={measured['measured_LRA']}:"
-                f"measured_thresh={measured['measured_thresh']}:"
-                f"offset={measured['offset']}:linear=true,"
-            )
+            return _format_linear_loudnorm(measured, target_i, target_tp, target_lra)
     # フォールバック：ライブストリーム、または実測失敗時
     return f'loudnorm=I={target_i}:TP={target_tp}:LRA={target_lra},'
 
@@ -9603,13 +9661,30 @@ def play_one_track(track, show_controls=True):
         gain_db = GAIN_PRESETS.get(current_gain_preset, 0.0)
         
         # ★★★ 音量一定化フィルターを構築 ★★★
-        # ※ 2パス実測方式は解析待ちで再生が止まる問題があったため保留し、
-        #    従来のリアルタイム1パス(dynamic)方式に戻す。
-        #    2パス関数(measure_track_loudness/build_loudnorm_filter)は
-        #    将来再検討する場合のためファイル内に残してあるが、現状は未使用。
+        # ※ かつては2パス実測方式が「解析待ちで再生が止まる」問題があり保留していたが、
+        #    今回：キャッシュに実測値があれば即座に2パス(linear=true)の正確な正規化を使い、
+        #    無ければ従来の1パス(dynamic)で再生しつつ、裏でこの曲と次の曲を先読み実測する
+        #    方式に変更。再生開始は一切ブロックしない。
         loudness_filter = ''
         if loudness_normalization:
-            loudness_filter = 'loudnorm=I=-16:TP=-2.0:LRA=11,'
+            _measured = _peek_cached_loudness(track_path) if track_path else None
+            if _measured:
+                loudness_filter = _format_linear_loudnorm(_measured)
+            else:
+                loudness_filter = 'loudnorm=I=-16:TP=-2.0:LRA=11,'
+                if track_path:
+                    _prefetch_loudness_async(track_path)  # 次回のために裏で今すぐ実測
+
+            # 次に再生される曲も先読みで実測しておく（フォルダー再生は対象外）
+            if current_playback_mode != 'folder':
+                try:
+                    _idx = current_playlist.index(track)
+                    if _idx + 1 < len(current_playlist):
+                        _next_path = current_playlist[_idx + 1].get('path', '')
+                        if _next_path:
+                            _prefetch_loudness_async(_next_path)
+                except ValueError:
+                    pass
         
         # ★★★ フィルター引数を構築（Air Particle Layer 対応） ★★★
         filter_args = _build_audio_filter_args(
