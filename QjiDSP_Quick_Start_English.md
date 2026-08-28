@@ -1,4 +1,5 @@
 # QjiDSP Quick Start
+
 ## — Downloaded QjiDSP? Start Here. —
 
 Thank you for downloading QjiDSP.
@@ -13,7 +14,7 @@ You do not need to understand all of its features to get started.
 
 ## 1. Start QjiDSP
 
-After installation, start QjiDSP from its directory:
+After installation, start QjiDSP from the desktop icon "Qji奏在" or from its directory:
 
 ```bash
 cd ~/qji
@@ -113,6 +114,8 @@ Then:
 That is the simplest way to discover QjiDSP.
 
 ---
+
+
 
 ### About QjiDSP
 
