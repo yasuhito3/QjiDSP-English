@@ -1,5 +1,3 @@
-🟢If you are using QjiDSP for the first time, please check this first → [QjiDSP Quick Start Guide](QjiDSP_Quick_Start_English.md)
-
 # QjiDSP Quick Start
 
 ## — Downloaded QjiDSP? Start Here. —
@@ -22,6 +20,8 @@ After installation, start QjiDSP from double-click the desktop icon "Qji奏在" 
 cd ~/qji
 python3 qji.py
 ```
+
+
 
 ## 2. Select your DAC
 
