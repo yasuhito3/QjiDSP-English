@@ -11076,7 +11076,7 @@ def play_tracks_gapless(tracks, start_index=0):
             output_sample_rate = upsampling_target_rate
             pass  # サンプリングレート情報（情報バーに表示済み）
         else:
-            output_sample_rate = original_sample_rate
+            output_sample_rate = 48000 if dsp_mode_active else original_sample_rate
             pass  # サンプリングレート情報
         
         # FFmpegコマンドを構築
