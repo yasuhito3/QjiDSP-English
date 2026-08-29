@@ -209,6 +209,7 @@ SUPPORTED_EXTENSIONS = ('.wav', '.flac', '.wma', '.aiff', '.aif', '.mp3', '.m4a'
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.bmp', '.gif')
 DATABASE_FILE = os.path.expanduser('~/music_mood_db.json')
 PRESETS_FILE = os.path.expanduser('~/.music_player_presets.json')  # ★★★ 追加: プリセットファイル ★★★
+FAVORITES_FILE = os.path.expanduser('~/.music_player_favorites.json')  # ★★★ Favorites file ★★★
 CURRENT_VOLUME = 12  # dB
 VOSK_MODEL_PATH = os.path.expanduser("~/vosk-model-ja-0.22")
 
@@ -995,15 +996,6 @@ def get_now_playing_control_html():
     line-height: 1.5; word-break: break-word; }
   .meta-label { color: #666; font-size: 0.75rem; margin-right: 4px; }
   #track-num { font-size: 0.78rem; color: #555; margin-top: 14px; }
-  #preset-badge {
-    display: none; align-items: center; justify-content: center; gap: 8px;
-    width: 100%; max-width: 360px; margin: 4px 0 20px;
-    padding: 9px 14px; border-radius: 20px;
-    background: #16202e; border: 1px solid #2a3f5a;
-    color: #8fc3f7; font-size: 0.85rem; font-weight: 600;
-    letter-spacing: 0.02em;
-  }
-  #preset-badge .preset-cap { color: #567; font-weight: 400; font-size: 0.75rem; }
   #status-dot {
     display: inline-block; width: 8px; height: 8px;
     background: #1db954; border-radius: 50%; margin-right: 6px;
@@ -1052,7 +1044,6 @@ def get_now_playing_control_html():
 <body>
 <div id="waiting"><div class="icon">🎵</div><div>再生待機中...</div></div>
 <div id="jacket" style="display:none"><div class="no-image">🎵</div></div>
-<div id="preset-badge"><span class="preset-cap">音場</span><span id="preset-label">—</span></div>
 <div id="info" style="display:none">
   <div id="title">—</div>
   <div class="meta-row"><span class="meta-label">作曲家</span><span id="composer">—</span></div>
@@ -1082,13 +1073,6 @@ def get_now_playing_control_html():
     document.getElementById('jacket').style.display = hasTrack ? 'block' : 'none';
     document.getElementById('info').style.display = hasTrack ? 'block' : 'none';
     document.getElementById('controls').style.display = 'flex';  /* 常時表示 */
-    const badge = document.getElementById('preset-badge');
-    if (data.preset_label) {
-      badge.style.display = 'flex';
-      document.getElementById('preset-label').textContent = data.preset_label;
-    } else {
-      badge.style.display = 'none';
-    }
     if (!hasTrack) return;
 
     document.getElementById('title').textContent = data.title || '—';
@@ -1245,9 +1229,6 @@ def start_now_playing_server():
                             'has_image':    has_image,
                             'image_ts':     str(int(os.path.getmtime(img_path) * 1000))
                                              if has_image else '0',
-                            'preset':       current_filter_preset,
-                            'preset_label': FILTER_PRESET_LABELS.get(
-                                                current_filter_preset, current_filter_preset),
                         }
                         if payload != last_sent:
                             line = 'data: ' + json.dumps(payload, ensure_ascii=False) + '\n\n'
@@ -1638,6 +1619,323 @@ def preset_management_menu():
         
         else:
             print("⚠️ Invalid selection")
+
+# ===== Favorites feature =====
+def load_favorites():
+    """Load the favorites list (returns an empty list if the file doesn't exist)"""
+    if not os.path.exists(FAVORITES_FILE):
+        return []
+    try:
+        with open(FAVORITES_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return data
+        return []
+    except Exception as e:
+        print(f"⚠️ Failed to read the favorites file: {e}")
+        return []
+
+
+def _save_favorites(favorites):
+    """Save the favorites list to disk"""
+    try:
+        with open(FAVORITES_FILE, 'w', encoding='utf-8') as f:
+            json.dump(favorites, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        print(f"⚠️ Failed to save favorites: {e}")
+        return False
+
+
+def _derive_auto_tags(track):
+    """Derive automatic organizing tags for a favorite from the track's metadata"""
+    tags = []
+    for key in ('genre', 'mood'):
+        val = (track.get(key) or '').strip()
+        if val and val not in tags:
+            tags.append(val)
+    return tags
+
+
+def add_favorite(track, extra_tags=None, note=''):
+    """Add a track to favorites (same path updates nothing — avoids duplicates)"""
+    if not track or not track.get('path'):
+        return False, "No track information available to register"
+
+    favorites = load_favorites()
+    path = track['path']
+
+    tags = _derive_auto_tags(track)
+    if extra_tags:
+        for t in extra_tags:
+            t = t.strip()
+            if t and t not in tags:
+                tags.append(t)
+
+    entry = {
+        'path': path,
+        'title': track.get('title', os.path.basename(path)),
+        'artist': track.get('artist', ''),
+        'composer': track.get('composer', ''),
+        'performer': track.get('performer', ''),
+        'conductor': track.get('conductor', ''),
+        'album': track.get('album', ''),
+        'genre': track.get('genre', ''),
+        'mood': track.get('mood', ''),
+        'tags': tags,
+        'note': note,
+        'added': time.strftime('%Y-%m-%d %H:%M:%S'),
+    }
+
+    for i, existing in enumerate(favorites):
+        if existing.get('path') == path:
+            # Already registered — keep existing tags/notes, just report it
+            return False, f"'{entry['title']}' is already in your favorites"
+
+    favorites.append(entry)
+    if _save_favorites(favorites):
+        return True, f"⭐ Added '{entry['title']}' to favorites" + (f" (tags: {', '.join(tags)})" if tags else "")
+    return False, "Failed to save"
+
+
+def remove_favorite(path):
+    """Remove a track from favorites"""
+    favorites = load_favorites()
+    new_favorites = [f for f in favorites if f.get('path') != path]
+    if len(new_favorites) == len(favorites):
+        return False, "That track wasn't found in favorites"
+    if _save_favorites(new_favorites):
+        return True, "🗑️ Removed from favorites"
+    return False, "Failed to save the removal"
+
+
+def _all_favorite_tags(favorites):
+    """Tally every tag currently used across favorites, with counts"""
+    counts = {}
+    for f in favorites:
+        for t in f.get('tags', []):
+            counts[t] = counts.get(t, 0) + 1
+    return counts
+
+
+def print_favorites(favorites, header="⭐ Favorites"):
+    """Print the favorites list with numbering"""
+    print(f"\n{header} ({len(favorites)} tracks)")
+    print("=" * 70)
+    if not favorites:
+        print("  (none registered)")
+        return
+    for i, f in enumerate(favorites, 1):
+        exists = "" if os.path.exists(f.get('path', '')) else "  ⚠️ file not found"
+        tag_str = f" [{', '.join(f.get('tags', []))}]" if f.get('tags') else ""
+        artist_line = f.get('artist') or f.get('performer') or f.get('composer') or ''
+        print(f"{i:>3}. {f.get('title', '?')}  — {artist_line}{tag_str}{exists}")
+        if f.get('note'):
+            print(f"      💬 {f['note']}")
+    print("=" * 70)
+
+
+def cleanup_missing_favorites():
+    """Detect favorites whose file can no longer be found, and remove them after confirmation"""
+    favorites = load_favorites()
+    missing = [f for f in favorites if not os.path.exists(f.get('path', ''))]
+    if not missing:
+        print("\n✅ No favorites are missing their file")
+        return
+    print(f"\n⚠️ {len(missing)} favorite(s) are missing their file:")
+    for f in missing:
+        print(f"  - {f.get('title', '?')} ({f.get('path', '')})")
+    confirm = input("\nRemove these from favorites? (y/n): ").strip().lower()
+    if confirm == 'y':
+        remaining = [f for f in favorites if os.path.exists(f.get('path', ''))]
+        if _save_favorites(remaining):
+            print(f"🗑️ Cleaned up {len(missing)} entr{'y' if len(missing) == 1 else 'ies'}")
+    else:
+        print("Cancelled")
+
+
+def _list_favorite_tags_numbered(favorites):
+    """Print tags sorted by frequency with numbers, and return the tag list"""
+    tag_counts = _all_favorite_tags(favorites)
+    tags_sorted = [t for t, _ in sorted(tag_counts.items(), key=lambda x: -x[1])]
+    if not tags_sorted:
+        return []
+    print("\n📌 Tags currently in use:")
+    for i, t in enumerate(tags_sorted, 1):
+        print(f"  {i:>2}. {t} ({tag_counts[t]} tracks)")
+    return tags_sorted
+
+
+def _prompt_tag_choice(tags_sorted, prompt_text):
+    """Let the user choose a tag by number, or by name (case-insensitive)"""
+    sel = input(f"\n{prompt_text}").strip()
+    if not sel:
+        return None
+    if sel.isdigit():
+        idx = int(sel) - 1
+        if 0 <= idx < len(tags_sorted):
+            return tags_sorted[idx]
+        print("⚠️ Invalid number")
+        return None
+    # Match against existing tags case-insensitively
+    for t in tags_sorted:
+        if t.lower() == sel.lower():
+            return t
+    # No exact match — return as-is (downstream filtering is also case-insensitive)
+    return sel
+
+
+def _favorites_matching_tag(favorites, tag_query):
+    """Filter favorites by tag name, matched case-insensitively"""
+    q = tag_query.lower()
+    return [f for f in favorites if any((t or '').lower() == q for t in f.get('tags', []))]
+
+
+def favorites_menu():
+    """Favorites management menu (list / filter by tag / play / edit / delete / cleanup)"""
+    while True:
+        favorites = load_favorites()
+        print("\n" + "=" * 70)
+        print("⭐ Favorites")
+        print("=" * 70)
+        print(f"1. Show the list (all {len(favorites)} tracks)")
+        print("2. Filter and show by tag")
+        print("3. Shuffle-play all favorites")
+        print("4. Play tracks matching a tag")
+        print("5. Pick and play a single track")
+        print("6. Edit tags / notes")
+        print("7. Remove from favorites")
+        print("8. Clean up missing files (broken-path check)")
+        print("0. Back to the main menu")
+        print("=" * 70)
+
+        choice = input("\nSelect: ").strip()
+
+        if choice == '1':
+            print_favorites(favorites)
+            input("\nPress Enter to continue...")
+
+        elif choice == '2':
+            tags_sorted = _list_favorite_tags_numbered(favorites)
+            if not tags_sorted:
+                print("\n(No favorites have tags yet)")
+                input("\nPress Enter to continue...")
+                continue
+            tag = _prompt_tag_choice(tags_sorted, "Enter a tag to show, by number or name: ")
+            if not tag:
+                continue
+            filtered = _favorites_matching_tag(favorites, tag)
+            print_favorites(filtered, header=f"⭐ Favorites tagged \"{tag}\"")
+            input("\nPress Enter to continue...")
+
+        elif choice == '3':
+            if not favorites:
+                print("\n(No favorites registered)")
+                input("\nPress Enter to continue...")
+                continue
+            playable = [f for f in favorites if os.path.exists(f.get('path', ''))]
+            if not playable:
+                print("\n⚠️ None of your favorites are playable (no files found)")
+                input("\nPress Enter to continue...")
+                continue
+            print(f"\n🎧 Shuffle-playing {len(playable)} favorite track(s)")
+            play_music_with_mode_switching(playable.copy())
+            continue
+
+        elif choice == '4':
+            tags_sorted = _list_favorite_tags_numbered(favorites)
+            if not tags_sorted:
+                print("\n(No favorites have tags yet)")
+                input("\nPress Enter to continue...")
+                continue
+            tag = _prompt_tag_choice(tags_sorted, "Enter a tag to play, by number or name: ")
+            if not tag:
+                continue
+            filtered = [f for f in _favorites_matching_tag(favorites, tag) if os.path.exists(f.get('path', ''))]
+            if not filtered:
+                print(f"\n⚠️ No playable tracks tagged \"{tag}\"")
+                input("\nPress Enter to continue...")
+                continue
+            print(f"\n🎧 Playing {len(filtered)} track(s) tagged \"{tag}\"")
+            play_music_with_mode_switching(filtered.copy())
+            continue
+
+        elif choice == '5':
+            if not favorites:
+                print("\n(No favorites registered)")
+                input("\nPress Enter to continue...")
+                continue
+            print_favorites(favorites)
+            sel = input("\nEnter the number of the track to play: ").strip()
+            if sel.isdigit() and 1 <= int(sel) <= len(favorites):
+                target = favorites[int(sel) - 1]
+                if not os.path.exists(target.get('path', '')):
+                    print("⚠️ File not found")
+                    input("\nPress Enter to continue...")
+                    continue
+                print(f"\n🎧 Playing '{target.get('title')}'")
+                play_music_with_mode_switching([dict(target)])
+                continue
+            else:
+                print("⚠️ Invalid number")
+                input("\nPress Enter to continue...")
+
+        elif choice == '6':
+            if not favorites:
+                print("\n(No favorites registered)")
+                input("\nPress Enter to continue...")
+                continue
+            print_favorites(favorites)
+            sel = input("\nEnter the number of the track to edit: ").strip()
+            if sel.isdigit() and 1 <= int(sel) <= len(favorites):
+                idx = int(sel) - 1
+                target = favorites[idx]
+                print(f"\nCurrent tags: {', '.join(target.get('tags', [])) or '(none)'}")
+                new_tags = input("New tags, comma-separated (Enter to keep, '-' to clear all): ").strip()
+                if new_tags == '-':
+                    target['tags'] = []
+                elif new_tags:
+                    target['tags'] = [t.strip() for t in new_tags.split(',') if t.strip()]
+                print(f"Current note: {target.get('note') or '(none)'}")
+                new_note = input("New note (Enter to keep, '-' to clear): ").strip()
+                if new_note == '-':
+                    target['note'] = ''
+                elif new_note:
+                    target['note'] = new_note
+                if _save_favorites(favorites):
+                    print("✅ Updated")
+                input("\nPress Enter to continue...")
+            else:
+                print("⚠️ Invalid number")
+                input("\nPress Enter to continue...")
+
+        elif choice == '7':
+            if not favorites:
+                print("\n(No favorites registered)")
+                input("\nPress Enter to continue...")
+                continue
+            print_favorites(favorites)
+            sel = input("\nEnter the number of the track to remove: ").strip()
+            if sel.isdigit() and 1 <= int(sel) <= len(favorites):
+                target = favorites[int(sel) - 1]
+                confirm = input(f"⚠️ Remove '{target.get('title')}' from favorites? (y/n): ").strip().lower()
+                if confirm == 'y':
+                    ok, msg = remove_favorite(target.get('path'))
+                    print(msg)
+            else:
+                print("⚠️ Invalid number")
+            input("\nPress Enter to continue...")
+
+        elif choice == '8':
+            cleanup_missing_favorites()
+            input("\nPress Enter to continue...")
+
+        elif choice == '0':
+            break
+
+        else:
+            print("⚠️ Invalid selection")
+
 
 # ===== イコライザー統合 =====
 EQUALIZER_SCRIPT = os.path.expanduser('~/audio_equalizer.py')
@@ -2591,7 +2889,7 @@ def show_cover_image(image_path):
 
 def create_cover_with_info(image_path, track_info):
     """ジャケット画像に曲情報を重ねた画像を作成"""
-    global air_particle_layer, musikverein_room_effects
+    global air_particle_layer, musikverein_room_effects, current_filter_preset, current_gain_preset
     try:
         # ImageMagickの確認
         subprocess.run(['which', 'convert'], check=True, capture_output=True)
@@ -2784,6 +3082,48 @@ def create_cover_with_info(image_path, track_info):
                     subprocess.run(composite_cmd, capture_output=True, check=True, timeout=5)
             except Exception:
                 pass  # バッジ生成失敗は無視して通常画像を使用
+        
+        # ★★★ Soundfield preset badge (top-left): mirrors the preset badge
+        #     already shown in the Android/browser Now Playing mirror, on the
+        #     PC's own cover-art display too ★★★
+        try:
+            _gain_labels_for_badge = {
+                'classical': 'Classical',
+                'general':   'General',
+                'jazz_pop':  'Pop',
+                'loud':      'Loud',
+            }
+            _filter_label = FILTER_PRESET_LABELS.get(current_filter_preset, current_filter_preset)
+            _gain_label = _gain_labels_for_badge.get(current_gain_preset, current_gain_preset)
+            preset_badge_label = f"🎼 {_filter_label}  |  🎚 {_gain_label}"
+
+            preset_badge_path = os.path.join(temp_dir, "preset_badge.png")
+            preset_badge_cmd = [
+                'convert',
+                '-size', '440x48',
+                'xc:none',
+                '-fill', 'rgba(10,10,10,0.82)',
+                '-draw', 'roundrectangle 0,0 439,47 12,12',
+                '-font', jp_font,
+                '-pointsize', '17',
+                '-fill', '#ffffff',
+                '-gravity', 'Center',
+                '-annotate', '+0+0', preset_badge_label,
+                preset_badge_path
+            ]
+            subprocess.run(preset_badge_cmd, capture_output=True, check=True, timeout=5)
+            if os.path.exists(preset_badge_path):
+                preset_composite_cmd = [
+                    'convert', output_path,
+                    preset_badge_path,
+                    '-gravity', 'NorthWest',
+                    '-geometry', '+12+12',
+                    '-composite',
+                    output_path
+                ]
+                subprocess.run(preset_composite_cmd, capture_output=True, check=True, timeout=5)
+        except Exception:
+            pass  # プリセットバッジ生成失敗は無視して通常画像を使用
         
         return output_path if os.path.exists(output_path) else image_path
     
@@ -9532,7 +9872,7 @@ def play_one_track(track, show_controls=True):
         terminal_print(f"   Mood: {color}{emoji} {mood_en}{reset}")
     
     if show_controls:
-        terminal_print("🎹 [r]Restart | [f]Play folder in order | [n]Next | [b]Prev | [i]Show image again | [q]Quit to menu")
+        terminal_print("🎹 [r]Restart | [f]Play folder in order | [n]Next | [b]Prev | [i]Show image again | [o]Add to favorites | [q]Quit to menu")
         _gp_labels = {'classical': 'Classical(0dB)', 'general': 'General(-1.5dB)', 'jazz_pop': 'Pop(-3.5dB)', 'loud': 'Loud(-5dB)'}
         terminal_print(f"🔊 [+][-]Output gain ({CURRENT_VOLUME:+d} dB) | [g]Input gain ({_gp_labels.get(current_gain_preset, current_gain_preset)}) | [c]Filter | [s]Save", end="")
         if SI_AVAILABLE:
@@ -10443,6 +10783,14 @@ def keyboard_listener():
                         terminal_print("   Pink-noise layer enabled → applied from next track (press R to restart now)")
                     replay_requested = True  # 即座に現在曲に反映
 
+                elif key == 'o':
+                    # ★★★ [o] Add the currently playing track to Favorites ★★★
+                    if current_playing_track and current_playing_track.get('path'):
+                        _ok, _msg = add_favorite(current_playing_track)
+                        terminal_print(f"\n{_msg}")
+                    else:
+                        terminal_print("\n⚠️ Couldn't get info for the currently playing track")
+
                 # ━━ Sonia Intelligence キー ━━━━━━━━━━━━━━━
                 elif key == 'z' and SI_AVAILABLE:
                     # ★★★ [z] Sonia Intelligence フィードバック入力 ★★★
@@ -10508,7 +10856,7 @@ def keyboard_listener():
                     # 画面クリア後にコントロール表示を再描画
                     try:
                         time.sleep(0.1)
-                        terminal_print("\n🎹 [r]Restart | [f]Folder | [n]Next | [b]Prev | [i]Show image | [q]Menu")
+                        terminal_print("\n🎹 [r]Restart | [f]Folder | [n]Next | [b]Prev | [i]Show image | [o]Favorite | [q]Menu")
                         _gp_l = {'classical': 'Classical(0dB)', 'general': 'General(-1.5dB)', 'jazz_pop': 'Pop(-3.5dB)', 'loud': 'Loud(-5dB)'}
                         terminal_print(f"🔊 [+][-]Output gain ({CURRENT_VOLUME:+d} dB) | [g]Gain ({_gp_l.get(current_gain_preset, current_gain_preset)}) | [c]Filter | [s]Save", end="")
                         if SI_AVAILABLE:
@@ -10519,7 +10867,7 @@ def keyboard_listener():
                         pass
                     # ── 画面クリア後にキーガイドを再表示 ──
                     time.sleep(0.1)
-                    terminal_print("\n🎹 [r]Restart | [f]Folder | [n]Next | [b]Prev | [i]Show image | [q]Menu")
+                    terminal_print("\n🎹 [r]Restart | [f]Folder | [n]Next | [b]Prev | [i]Show image | [o]Favorite | [q]Menu")
                     _fp = FILTER_PRESET_LABELS.get(current_filter_preset, current_filter_preset)
                     _gp_l2 = {'classical': 'Classical(0dB)', 'general': 'General(-1.5dB)', 'jazz_pop': 'Pop(-3.5dB)', 'loud': 'Loud(-5dB)'}
                     terminal_print(f"🔊 [+][-]Output gain ({CURRENT_VOLUME:+d} dB) | [g]Gain ({_gp_l2.get(current_gain_preset, current_gain_preset)}) | [c]Filter ({_fp}) | [s]Save", end="")
@@ -11451,6 +11799,7 @@ def interactive_mode():
         print("  N. 🆕  Recently added (cover-art browser)")  # ★★★ 追加: 最新アルバム ★★★
         print("  R. 📻 Radio stations")  # ★★★ 追加: ラジオ ★★★
         print("  P. 💾 Preset management")  # ★★★ 追加 ★★★
+        print(f"  K. ⭐ Favorites ({len(load_favorites())} tracks)")  # ★★★ Favorites feature ★★★
         print("  A. 🎚️ Audio preset")
         print("  G. 🎛️ Gain preset")
         print("  L. 🔊 Loudness normalisation")  # ★★★ 追加 ★★★
@@ -11475,7 +11824,7 @@ def interactive_mode():
         print("💡 Press [q] during playback to return to this menu")
 
         try:
-            choice = input("\nChoice (0-9, J, N, M, R, P, A, G, L, T, W, V, F, E, Z, U, QB, S, Y, AP, DL, X, Q): ").strip().lower()
+            choice = input("\nChoice (0-9, J, N, M, R, P, K, A, G, L, T, W, V, F, E, Z, U, QB, S, Y, AP, DL, X, Q): ").strip().lower()
 
             if choice == '0':
                 print("\n🎵 Random shuffle mode — all tracks")
@@ -12200,6 +12549,10 @@ def interactive_mode():
 
             elif choice == 'p':  # ★★★ プリセット管理 ★★★
                 preset_management_menu()
+                continue
+
+            elif choice == 'k':  # ★★★ Favorites ★★★
+                favorites_menu()
                 continue
 
             elif choice == 'qb':
