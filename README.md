@@ -1,5 +1,3 @@
-🟢If you are using QjiDSP for the first time, please check this first → [QjiDSP Quick Start Guide](QjiDSP_Quick_Start_English.md)
-
 # Qji
 
 A hi-fi music playback system for Linux. In addition to local file playback, it integrates streaming from Qobuz, SoundCloud, and YouTube Music, 3D spatial audio extension via CamillaDSP (soundfields v1-v6), genre-adaptive EQ (Sonia Intelligence), and automatic distortion mitigation (Auto De-Clip).
@@ -10,8 +8,6 @@ A hi-fi music playback system for Linux. In addition to local file playback, it 
 > If you haven't installed it yet, please set that up first, following its own install instructions, before running this repository's installer.
 
 ---
-
-
 
 ## Features
 
@@ -32,8 +28,6 @@ A hi-fi music playback system for Linux. In addition to local file playback, it 
 
 ---
 
-
-
 ## Requirements
 
 - Linux (tested on Ubuntu / Linux Mint)
@@ -44,11 +38,7 @@ A hi-fi music playback system for Linux. In addition to local file playback, it 
 
 ---
 
-
-
 ## Installation
-
-
 
 ### 0. Prerequisite: install the base Qji app (if not already installed)
 
@@ -60,20 +50,16 @@ cd Qji-Network-Audio-Player
 # follow the base Qji app's own install instructions
 ```
 
-
-
 ### 1. Get this repository (the QjiDSP extension)
 
 ```bash
-git clone https://github.com/<your-username>/<this-repo-name>.git
-cd <this-repo-name>/qjidsp_installer
+git clone https://github.com/yasuhito3/QjiDSP-English.git
+cd QjiDSP-English/qjidsp_installer
 ```
 
-> 📦 The installer itself, DSP config files, IR file, etc. are all bundled inside the `qjidsp_installer/` **folder**.
-> If you used GitHub's "Download ZIP" option, extract it, go into the resulting folder (something like `<this-repo-name>-main/`),
+> 📦 The installer itself, DSP config files, IR file, etc. are all bundled inside the **`qjidsp_installer/` folder**.
+> If you used GitHub's "Download ZIP" option, extract it, go into the resulting folder (something like `QjiDSP-English-main/`),
 > and then into `qjidsp_installer/` before continuing to the next step.
-
-
 
 ### 2. Run the installer
 
@@ -110,11 +96,20 @@ Selecting "Loopback" as the output device lets you choose from six soundfields (
 
 ---
 
+## Updating
 
+Once installed, you don't need to re-download the zip or `git clone` again each time. The installer places `update_qjidsp.sh` (plus a desktop icon for it) into `~/qji/` for you.
+
+- **From the terminal**: `cd ~/qji && bash update_qjidsp.sh`
+- **From the desktop icon**: double-click `~/qji/QjiDSP Update Checker.desktop`
+
+This checks this repository's `VERSION` file, and if a newer version is available, downloads it (after confirmation) and re-runs `install_qjidsp.sh` with the latest files. Any existing files that get overwritten are automatically backed up with a timestamp, per the installer's usual behavior. If you're already on the latest version, it just says so and exits.
+
+This is the same approach used by Qji Peak Monitor's update checker.
+
+---
 
 ## Optional setup
-
-
 
 ### YouTube Music (library access)
 
@@ -139,16 +134,10 @@ Get a model from [alphacep/vosk-api](https://alphacephei.com/vosk/models) or sim
 
 ### Qji Peak Monitor (stereo VU meter)
 
-⚠️ **Not included in this installer (**`install_qjidsp.sh`**).** It's a separate, optional repository:
-👉 **[Qji Peak Monitor](https://github.com/yasuhito3/Qji-peak-monitor)**
-
-A standalone real-time stereo peak/VU meter for Qji's final output stage, with a display-delay
-feature to compensate for downstream buffering (handy when listening through QjiDSP). See that
-repository's README for installation and usage instructions.
+⚠️ **Not included in this installer (`install_qjidsp.sh`).** Planned as a separate optional repository on GitHub.
+If you need it, please use that repository separately (link to be added once published).
 
 ---
-
-
 
 ## Command-line options
 
@@ -161,8 +150,6 @@ python3 qji.py --no-voice                       # launch with voice recognition 
 ```
 
 ---
-
-
 
 ## Troubleshooting
 
@@ -182,13 +169,14 @@ speaker-test -D hw:CARD=Loopback,DEV=0 -c 2 -r 48000 -F S32_LE
 
 ---
 
-
-
 ## Directory layout (after installation)
 
 ```
 ~/qji/
 ├── qji.py                      # main app
+├── VERSION                     # installed version (read by update_qjidsp.sh)
+├── update_qjidsp.sh            # update checker script
+├── QjiDSP Update Checker.desktop  # desktop-icon version of the above
 ├── qji_qobuzdsp.py             # Qobuz module
 ├── qji_qobuz_browser.py        # Qobuz browser UI
 ├── qji_soundcloud.py           # SoundCloud module
@@ -206,8 +194,6 @@ speaker-test -D hw:CARD=Loopback,DEV=0 -c 2 -r 48000 -F S32_LE
 ```
 
 ---
-
-
 
 ## Acknowledgments & libraries used
 

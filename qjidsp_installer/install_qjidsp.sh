@@ -335,6 +335,29 @@ PYEOF
 
 ok "File placement and path adjustments complete"
 
+# --- Place VERSION / the update script ---
+# update_qjidsp.sh uses this to check the currently installed
+# version. Placing it inside ~/qji/ means the update check works
+# even if the qjidsp_installer/ folder isn't kept around — just
+# "cd ~/qji && bash update_qjidsp.sh".
+if [ -f "$SCRIPT_DIR/VERSION" ]; then
+    cp "$SCRIPT_DIR/VERSION" "$QJI_DIR/VERSION"
+else
+    echo "unknown" > "$QJI_DIR/VERSION"
+fi
+if [ -f "$SCRIPT_DIR/update_qjidsp.sh" ]; then
+    cp "$SCRIPT_DIR/update_qjidsp.sh" "$QJI_DIR/update_qjidsp.sh"
+    chmod +x "$QJI_DIR/update_qjidsp.sh"
+fi
+if [ -f "$SCRIPT_DIR/QjiDSP Update Checker.desktop" ]; then
+    cp "$SCRIPT_DIR/QjiDSP Update Checker.desktop" "$QJI_DIR/QjiDSP Update Checker.desktop"
+    chmod +x "$QJI_DIR/QjiDSP Update Checker.desktop"
+    if command -v gio >/dev/null 2>&1; then
+        gio set "$QJI_DIR/QjiDSP Update Checker.desktop" "metadata::trusted" true >/dev/null 2>&1 || true
+    fi
+fi
+ok "Placed VERSION / the update script / the update-checker icon"
+
 # -------------------------------------------------------------
 # Step 7: Check the desktop icon
 # -------------------------------------------------------------
@@ -399,5 +422,9 @@ echo "  right after choosing a DSP mode."
 echo ""
 echo "  deno's PATH has been added to ~/.bashrc."
 echo "  Open a new terminal, or run 'source ~/.bashrc', for it to take effect."
+echo ""
+echo "  Checking for updates:"
+echo "    cd ${QJI_DIR} && bash update_qjidsp.sh"
+echo "    (or double-click ${QJI_DIR}/QjiDSP Update Checker.desktop)"
 echo -e "${GREEN}${BOLD}============================================================${RESET}"
 read -rp "Press Enter to close..." _

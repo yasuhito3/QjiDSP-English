@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=QjiDSP Update Checker
+Name[en]=QjiDSP Update Checker
+GenericName=QjiDSP Update Checker
+Comment=Checks GitHub for a newer version and updates QjiDSP if available
+Exec=bash update_qjidsp.sh
+Icon=system-software-update
+Terminal=true
+StartupNotify=false
+Categories=System;Utility;
+Keywords=Qji;QjiDSP;CamillaDSP;update;

@@ -209,7 +209,6 @@ SUPPORTED_EXTENSIONS = ('.wav', '.flac', '.wma', '.aiff', '.aif', '.mp3', '.m4a'
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.bmp', '.gif')
 DATABASE_FILE = os.path.expanduser('~/music_mood_db.json')
 PRESETS_FILE = os.path.expanduser('~/.music_player_presets.json')  # ★★★ 追加: プリセットファイル ★★★
-FAVORITES_FILE = os.path.expanduser('~/.music_player_favorites.json')  # ★★★ Favorites file ★★★
 CURRENT_VOLUME = 12  # dB
 VOSK_MODEL_PATH = os.path.expanduser("~/vosk-model-ja-0.22")
 
@@ -1620,323 +1619,6 @@ def preset_management_menu():
         else:
             print("⚠️ Invalid selection")
 
-# ===== Favorites feature =====
-def load_favorites():
-    """Load the favorites list (returns an empty list if the file doesn't exist)"""
-    if not os.path.exists(FAVORITES_FILE):
-        return []
-    try:
-        with open(FAVORITES_FILE, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        if isinstance(data, list):
-            return data
-        return []
-    except Exception as e:
-        print(f"⚠️ Failed to read the favorites file: {e}")
-        return []
-
-
-def _save_favorites(favorites):
-    """Save the favorites list to disk"""
-    try:
-        with open(FAVORITES_FILE, 'w', encoding='utf-8') as f:
-            json.dump(favorites, f, ensure_ascii=False, indent=2)
-        return True
-    except Exception as e:
-        print(f"⚠️ Failed to save favorites: {e}")
-        return False
-
-
-def _derive_auto_tags(track):
-    """Derive automatic organizing tags for a favorite from the track's metadata"""
-    tags = []
-    for key in ('genre', 'mood'):
-        val = (track.get(key) or '').strip()
-        if val and val not in tags:
-            tags.append(val)
-    return tags
-
-
-def add_favorite(track, extra_tags=None, note=''):
-    """Add a track to favorites (same path updates nothing — avoids duplicates)"""
-    if not track or not track.get('path'):
-        return False, "No track information available to register"
-
-    favorites = load_favorites()
-    path = track['path']
-
-    tags = _derive_auto_tags(track)
-    if extra_tags:
-        for t in extra_tags:
-            t = t.strip()
-            if t and t not in tags:
-                tags.append(t)
-
-    entry = {
-        'path': path,
-        'title': track.get('title', os.path.basename(path)),
-        'artist': track.get('artist', ''),
-        'composer': track.get('composer', ''),
-        'performer': track.get('performer', ''),
-        'conductor': track.get('conductor', ''),
-        'album': track.get('album', ''),
-        'genre': track.get('genre', ''),
-        'mood': track.get('mood', ''),
-        'tags': tags,
-        'note': note,
-        'added': time.strftime('%Y-%m-%d %H:%M:%S'),
-    }
-
-    for i, existing in enumerate(favorites):
-        if existing.get('path') == path:
-            # Already registered — keep existing tags/notes, just report it
-            return False, f"'{entry['title']}' is already in your favorites"
-
-    favorites.append(entry)
-    if _save_favorites(favorites):
-        return True, f"⭐ Added '{entry['title']}' to favorites" + (f" (tags: {', '.join(tags)})" if tags else "")
-    return False, "Failed to save"
-
-
-def remove_favorite(path):
-    """Remove a track from favorites"""
-    favorites = load_favorites()
-    new_favorites = [f for f in favorites if f.get('path') != path]
-    if len(new_favorites) == len(favorites):
-        return False, "That track wasn't found in favorites"
-    if _save_favorites(new_favorites):
-        return True, "🗑️ Removed from favorites"
-    return False, "Failed to save the removal"
-
-
-def _all_favorite_tags(favorites):
-    """Tally every tag currently used across favorites, with counts"""
-    counts = {}
-    for f in favorites:
-        for t in f.get('tags', []):
-            counts[t] = counts.get(t, 0) + 1
-    return counts
-
-
-def print_favorites(favorites, header="⭐ Favorites"):
-    """Print the favorites list with numbering"""
-    print(f"\n{header} ({len(favorites)} tracks)")
-    print("=" * 70)
-    if not favorites:
-        print("  (none registered)")
-        return
-    for i, f in enumerate(favorites, 1):
-        exists = "" if os.path.exists(f.get('path', '')) else "  ⚠️ file not found"
-        tag_str = f" [{', '.join(f.get('tags', []))}]" if f.get('tags') else ""
-        artist_line = f.get('artist') or f.get('performer') or f.get('composer') or ''
-        print(f"{i:>3}. {f.get('title', '?')}  — {artist_line}{tag_str}{exists}")
-        if f.get('note'):
-            print(f"      💬 {f['note']}")
-    print("=" * 70)
-
-
-def cleanup_missing_favorites():
-    """Detect favorites whose file can no longer be found, and remove them after confirmation"""
-    favorites = load_favorites()
-    missing = [f for f in favorites if not os.path.exists(f.get('path', ''))]
-    if not missing:
-        print("\n✅ No favorites are missing their file")
-        return
-    print(f"\n⚠️ {len(missing)} favorite(s) are missing their file:")
-    for f in missing:
-        print(f"  - {f.get('title', '?')} ({f.get('path', '')})")
-    confirm = input("\nRemove these from favorites? (y/n): ").strip().lower()
-    if confirm == 'y':
-        remaining = [f for f in favorites if os.path.exists(f.get('path', ''))]
-        if _save_favorites(remaining):
-            print(f"🗑️ Cleaned up {len(missing)} entr{'y' if len(missing) == 1 else 'ies'}")
-    else:
-        print("Cancelled")
-
-
-def _list_favorite_tags_numbered(favorites):
-    """Print tags sorted by frequency with numbers, and return the tag list"""
-    tag_counts = _all_favorite_tags(favorites)
-    tags_sorted = [t for t, _ in sorted(tag_counts.items(), key=lambda x: -x[1])]
-    if not tags_sorted:
-        return []
-    print("\n📌 Tags currently in use:")
-    for i, t in enumerate(tags_sorted, 1):
-        print(f"  {i:>2}. {t} ({tag_counts[t]} tracks)")
-    return tags_sorted
-
-
-def _prompt_tag_choice(tags_sorted, prompt_text):
-    """Let the user choose a tag by number, or by name (case-insensitive)"""
-    sel = input(f"\n{prompt_text}").strip()
-    if not sel:
-        return None
-    if sel.isdigit():
-        idx = int(sel) - 1
-        if 0 <= idx < len(tags_sorted):
-            return tags_sorted[idx]
-        print("⚠️ Invalid number")
-        return None
-    # Match against existing tags case-insensitively
-    for t in tags_sorted:
-        if t.lower() == sel.lower():
-            return t
-    # No exact match — return as-is (downstream filtering is also case-insensitive)
-    return sel
-
-
-def _favorites_matching_tag(favorites, tag_query):
-    """Filter favorites by tag name, matched case-insensitively"""
-    q = tag_query.lower()
-    return [f for f in favorites if any((t or '').lower() == q for t in f.get('tags', []))]
-
-
-def favorites_menu():
-    """Favorites management menu (list / filter by tag / play / edit / delete / cleanup)"""
-    while True:
-        favorites = load_favorites()
-        print("\n" + "=" * 70)
-        print("⭐ Favorites")
-        print("=" * 70)
-        print(f"1. Show the list (all {len(favorites)} tracks)")
-        print("2. Filter and show by tag")
-        print("3. Shuffle-play all favorites")
-        print("4. Play tracks matching a tag")
-        print("5. Pick and play a single track")
-        print("6. Edit tags / notes")
-        print("7. Remove from favorites")
-        print("8. Clean up missing files (broken-path check)")
-        print("0. Back to the main menu")
-        print("=" * 70)
-
-        choice = input("\nSelect: ").strip()
-
-        if choice == '1':
-            print_favorites(favorites)
-            input("\nPress Enter to continue...")
-
-        elif choice == '2':
-            tags_sorted = _list_favorite_tags_numbered(favorites)
-            if not tags_sorted:
-                print("\n(No favorites have tags yet)")
-                input("\nPress Enter to continue...")
-                continue
-            tag = _prompt_tag_choice(tags_sorted, "Enter a tag to show, by number or name: ")
-            if not tag:
-                continue
-            filtered = _favorites_matching_tag(favorites, tag)
-            print_favorites(filtered, header=f"⭐ Favorites tagged \"{tag}\"")
-            input("\nPress Enter to continue...")
-
-        elif choice == '3':
-            if not favorites:
-                print("\n(No favorites registered)")
-                input("\nPress Enter to continue...")
-                continue
-            playable = [f for f in favorites if os.path.exists(f.get('path', ''))]
-            if not playable:
-                print("\n⚠️ None of your favorites are playable (no files found)")
-                input("\nPress Enter to continue...")
-                continue
-            print(f"\n🎧 Shuffle-playing {len(playable)} favorite track(s)")
-            play_music_with_mode_switching(playable.copy())
-            continue
-
-        elif choice == '4':
-            tags_sorted = _list_favorite_tags_numbered(favorites)
-            if not tags_sorted:
-                print("\n(No favorites have tags yet)")
-                input("\nPress Enter to continue...")
-                continue
-            tag = _prompt_tag_choice(tags_sorted, "Enter a tag to play, by number or name: ")
-            if not tag:
-                continue
-            filtered = [f for f in _favorites_matching_tag(favorites, tag) if os.path.exists(f.get('path', ''))]
-            if not filtered:
-                print(f"\n⚠️ No playable tracks tagged \"{tag}\"")
-                input("\nPress Enter to continue...")
-                continue
-            print(f"\n🎧 Playing {len(filtered)} track(s) tagged \"{tag}\"")
-            play_music_with_mode_switching(filtered.copy())
-            continue
-
-        elif choice == '5':
-            if not favorites:
-                print("\n(No favorites registered)")
-                input("\nPress Enter to continue...")
-                continue
-            print_favorites(favorites)
-            sel = input("\nEnter the number of the track to play: ").strip()
-            if sel.isdigit() and 1 <= int(sel) <= len(favorites):
-                target = favorites[int(sel) - 1]
-                if not os.path.exists(target.get('path', '')):
-                    print("⚠️ File not found")
-                    input("\nPress Enter to continue...")
-                    continue
-                print(f"\n🎧 Playing '{target.get('title')}'")
-                play_music_with_mode_switching([dict(target)])
-                continue
-            else:
-                print("⚠️ Invalid number")
-                input("\nPress Enter to continue...")
-
-        elif choice == '6':
-            if not favorites:
-                print("\n(No favorites registered)")
-                input("\nPress Enter to continue...")
-                continue
-            print_favorites(favorites)
-            sel = input("\nEnter the number of the track to edit: ").strip()
-            if sel.isdigit() and 1 <= int(sel) <= len(favorites):
-                idx = int(sel) - 1
-                target = favorites[idx]
-                print(f"\nCurrent tags: {', '.join(target.get('tags', [])) or '(none)'}")
-                new_tags = input("New tags, comma-separated (Enter to keep, '-' to clear all): ").strip()
-                if new_tags == '-':
-                    target['tags'] = []
-                elif new_tags:
-                    target['tags'] = [t.strip() for t in new_tags.split(',') if t.strip()]
-                print(f"Current note: {target.get('note') or '(none)'}")
-                new_note = input("New note (Enter to keep, '-' to clear): ").strip()
-                if new_note == '-':
-                    target['note'] = ''
-                elif new_note:
-                    target['note'] = new_note
-                if _save_favorites(favorites):
-                    print("✅ Updated")
-                input("\nPress Enter to continue...")
-            else:
-                print("⚠️ Invalid number")
-                input("\nPress Enter to continue...")
-
-        elif choice == '7':
-            if not favorites:
-                print("\n(No favorites registered)")
-                input("\nPress Enter to continue...")
-                continue
-            print_favorites(favorites)
-            sel = input("\nEnter the number of the track to remove: ").strip()
-            if sel.isdigit() and 1 <= int(sel) <= len(favorites):
-                target = favorites[int(sel) - 1]
-                confirm = input(f"⚠️ Remove '{target.get('title')}' from favorites? (y/n): ").strip().lower()
-                if confirm == 'y':
-                    ok, msg = remove_favorite(target.get('path'))
-                    print(msg)
-            else:
-                print("⚠️ Invalid number")
-            input("\nPress Enter to continue...")
-
-        elif choice == '8':
-            cleanup_missing_favorites()
-            input("\nPress Enter to continue...")
-
-        elif choice == '0':
-            break
-
-        else:
-            print("⚠️ Invalid selection")
-
-
 # ===== イコライザー統合 =====
 EQUALIZER_SCRIPT = os.path.expanduser('~/audio_equalizer.py')
 
@@ -2083,48 +1765,6 @@ def measure_track_loudness(file_path, target_i='-16', target_tp='-2.0', target_l
     return measured
 
 
-def _format_linear_loudnorm(measured, target_i='-16', target_tp='-2.0', target_lra='11'):
-    """実測値(measure_track_loudness の戻り値)から2パス(linear=true)の
-    loudnormフィルター文字列を組み立てる。末尾にカンマを含む。"""
-    return (
-        f'loudnorm=I={target_i}:TP={target_tp}:LRA={target_lra}:'
-        f"measured_I={measured['measured_I']}:"
-        f"measured_TP={measured['measured_TP']}:"
-        f"measured_LRA={measured['measured_LRA']}:"
-        f"measured_thresh={measured['measured_thresh']}:"
-        f"offset={measured['offset']}:linear=true,"
-    )
-
-
-def _peek_cached_loudness(file_path, target_i='-16', target_tp='-2.0', target_lra='11'):
-    """ffmpegを一切呼ばず、キャッシュに実測値が既にあるかどうかだけを確認する。
-    os.stat()＋辞書参照のみなので実質コスト0。再生開始を絶対にブロックしない
-    ためにこれを使い、無ければ従来の1パス方式にフォールバックする。"""
-    if not file_path:
-        return None
-    try:
-        st = os.stat(file_path)
-        cache_key = f"{file_path}|{st.st_mtime}|{st.st_size}|{target_i}|{target_tp}|{target_lra}"
-    except OSError:
-        return None
-    with _loudness_cache_lock:
-        cache = _load_loudness_cache()
-        return cache.get(cache_key)
-
-
-def _prefetch_loudness_async(file_path, target_i='-16', target_tp='-2.0', target_lra='11'):
-    """バックグラウンドスレッドで実測してキャッシュへ書き込む（再生は一切ブロックしない）。
-    次に再生される曲の"先読み"や、未実測だった曲の"次回のための実測"に使う。"""
-    if not file_path:
-        return
-    def _worker():
-        try:
-            measure_track_loudness(file_path, target_i, target_tp, target_lra)
-        except Exception:
-            pass
-    threading.Thread(target=_worker, daemon=True, name='loudness-prefetch').start()
-
-
 def build_loudnorm_filter(file_path=None, target_i='-16', target_tp='-2.0', target_lra='11'):
     """
     音量一定化フィルター文字列を構築する。
@@ -2132,15 +1772,19 @@ def build_loudnorm_filter(file_path=None, target_i='-16', target_tp='-2.0', targ
     正確なラウドネス正規化を行う（曲ごとの音量差を実際に揃える）。
     file_path が無い(ラジオ/AirPlay等のライブストリーム)、または実測失敗時は
     従来通りのリアルタイム1パス(dynamic)方式にフォールバックする。
-    ★ 注意: 実測がキャッシュに無い場合ここでffmpegの解析パスを同期実行するため、
-    再生開始をブロックしたくない箇所（通常/ランダム再生）では使わないこと。
-    そちらは _peek_cached_loudness + _prefetch_loudness_async を使う。
     末尾にカンマを含む形式で返す（空文字なら未使用）。
     """
     if file_path:
         measured = measure_track_loudness(file_path, target_i, target_tp, target_lra)
         if measured:
-            return _format_linear_loudnorm(measured, target_i, target_tp, target_lra)
+            return (
+                f'loudnorm=I={target_i}:TP={target_tp}:LRA={target_lra}:'
+                f"measured_I={measured['measured_I']}:"
+                f"measured_TP={measured['measured_TP']}:"
+                f"measured_LRA={measured['measured_LRA']}:"
+                f"measured_thresh={measured['measured_thresh']}:"
+                f"offset={measured['offset']}:linear=true,"
+            )
     # フォールバック：ライブストリーム、または実測失敗時
     return f'loudnorm=I={target_i}:TP={target_tp}:LRA={target_lra},'
 
@@ -2889,7 +2533,7 @@ def show_cover_image(image_path):
 
 def create_cover_with_info(image_path, track_info):
     """ジャケット画像に曲情報を重ねた画像を作成"""
-    global air_particle_layer, musikverein_room_effects, current_filter_preset, current_gain_preset
+    global air_particle_layer, musikverein_room_effects
     try:
         # ImageMagickの確認
         subprocess.run(['which', 'convert'], check=True, capture_output=True)
@@ -3082,48 +2726,6 @@ def create_cover_with_info(image_path, track_info):
                     subprocess.run(composite_cmd, capture_output=True, check=True, timeout=5)
             except Exception:
                 pass  # バッジ生成失敗は無視して通常画像を使用
-        
-        # ★★★ Soundfield preset badge (top-left): mirrors the preset badge
-        #     already shown in the Android/browser Now Playing mirror, on the
-        #     PC's own cover-art display too ★★★
-        try:
-            _gain_labels_for_badge = {
-                'classical': 'Classical',
-                'general':   'General',
-                'jazz_pop':  'Pop',
-                'loud':      'Loud',
-            }
-            _filter_label = FILTER_PRESET_LABELS.get(current_filter_preset, current_filter_preset)
-            _gain_label = _gain_labels_for_badge.get(current_gain_preset, current_gain_preset)
-            preset_badge_label = f"🎼 {_filter_label}  |  🎚 {_gain_label}"
-
-            preset_badge_path = os.path.join(temp_dir, "preset_badge.png")
-            preset_badge_cmd = [
-                'convert',
-                '-size', '440x48',
-                'xc:none',
-                '-fill', 'rgba(10,10,10,0.82)',
-                '-draw', 'roundrectangle 0,0 439,47 12,12',
-                '-font', jp_font,
-                '-pointsize', '17',
-                '-fill', '#ffffff',
-                '-gravity', 'Center',
-                '-annotate', '+0+0', preset_badge_label,
-                preset_badge_path
-            ]
-            subprocess.run(preset_badge_cmd, capture_output=True, check=True, timeout=5)
-            if os.path.exists(preset_badge_path):
-                preset_composite_cmd = [
-                    'convert', output_path,
-                    preset_badge_path,
-                    '-gravity', 'NorthWest',
-                    '-geometry', '+12+12',
-                    '-composite',
-                    output_path
-                ]
-                subprocess.run(preset_composite_cmd, capture_output=True, check=True, timeout=5)
-        except Exception:
-            pass  # プリセットバッジ生成失敗は無視して通常画像を使用
         
         return output_path if os.path.exists(output_path) else image_path
     
@@ -9872,7 +9474,7 @@ def play_one_track(track, show_controls=True):
         terminal_print(f"   Mood: {color}{emoji} {mood_en}{reset}")
     
     if show_controls:
-        terminal_print("🎹 [r]Restart | [f]Play folder in order | [n]Next | [b]Prev | [i]Show image again | [o]Add to favorites | [q]Quit to menu")
+        terminal_print("🎹 [r]Restart | [f]Play folder in order | [n]Next | [b]Prev | [i]Show image again | [q]Quit to menu")
         _gp_labels = {'classical': 'Classical(0dB)', 'general': 'General(-1.5dB)', 'jazz_pop': 'Pop(-3.5dB)', 'loud': 'Loud(-5dB)'}
         terminal_print(f"🔊 [+][-]Output gain ({CURRENT_VOLUME:+d} dB) | [g]Input gain ({_gp_labels.get(current_gain_preset, current_gain_preset)}) | [c]Filter | [s]Save", end="")
         if SI_AVAILABLE:
@@ -10001,30 +9603,13 @@ def play_one_track(track, show_controls=True):
         gain_db = GAIN_PRESETS.get(current_gain_preset, 0.0)
         
         # ★★★ 音量一定化フィルターを構築 ★★★
-        # ※ かつては2パス実測方式が「解析待ちで再生が止まる」問題があり保留していたが、
-        #    今回：キャッシュに実測値があれば即座に2パス(linear=true)の正確な正規化を使い、
-        #    無ければ従来の1パス(dynamic)で再生しつつ、裏でこの曲と次の曲を先読み実測する
-        #    方式に変更。再生開始は一切ブロックしない。
+        # ※ 2パス実測方式は解析待ちで再生が止まる問題があったため保留し、
+        #    従来のリアルタイム1パス(dynamic)方式に戻す。
+        #    2パス関数(measure_track_loudness/build_loudnorm_filter)は
+        #    将来再検討する場合のためファイル内に残してあるが、現状は未使用。
         loudness_filter = ''
         if loudness_normalization:
-            _measured = _peek_cached_loudness(track_path) if track_path else None
-            if _measured:
-                loudness_filter = _format_linear_loudnorm(_measured)
-            else:
-                loudness_filter = 'loudnorm=I=-16:TP=-2.0:LRA=11,'
-                if track_path:
-                    _prefetch_loudness_async(track_path)  # 次回のために裏で今すぐ実測
-
-            # 次に再生される曲も先読みで実測しておく（フォルダー再生は対象外）
-            if current_playback_mode != 'folder':
-                try:
-                    _idx = current_playlist.index(track)
-                    if _idx + 1 < len(current_playlist):
-                        _next_path = current_playlist[_idx + 1].get('path', '')
-                        if _next_path:
-                            _prefetch_loudness_async(_next_path)
-                except ValueError:
-                    pass
+            loudness_filter = 'loudnorm=I=-16:TP=-2.0:LRA=11,'
         
         # ★★★ フィルター引数を構築（Air Particle Layer 対応） ★★★
         filter_args = _build_audio_filter_args(
@@ -10783,14 +10368,6 @@ def keyboard_listener():
                         terminal_print("   Pink-noise layer enabled → applied from next track (press R to restart now)")
                     replay_requested = True  # 即座に現在曲に反映
 
-                elif key == 'o':
-                    # ★★★ [o] Add the currently playing track to Favorites ★★★
-                    if current_playing_track and current_playing_track.get('path'):
-                        _ok, _msg = add_favorite(current_playing_track)
-                        terminal_print(f"\n{_msg}")
-                    else:
-                        terminal_print("\n⚠️ Couldn't get info for the currently playing track")
-
                 # ━━ Sonia Intelligence キー ━━━━━━━━━━━━━━━
                 elif key == 'z' and SI_AVAILABLE:
                     # ★★★ [z] Sonia Intelligence フィードバック入力 ★★★
@@ -10856,7 +10433,7 @@ def keyboard_listener():
                     # 画面クリア後にコントロール表示を再描画
                     try:
                         time.sleep(0.1)
-                        terminal_print("\n🎹 [r]Restart | [f]Folder | [n]Next | [b]Prev | [i]Show image | [o]Favorite | [q]Menu")
+                        terminal_print("\n🎹 [r]Restart | [f]Folder | [n]Next | [b]Prev | [i]Show image | [q]Menu")
                         _gp_l = {'classical': 'Classical(0dB)', 'general': 'General(-1.5dB)', 'jazz_pop': 'Pop(-3.5dB)', 'loud': 'Loud(-5dB)'}
                         terminal_print(f"🔊 [+][-]Output gain ({CURRENT_VOLUME:+d} dB) | [g]Gain ({_gp_l.get(current_gain_preset, current_gain_preset)}) | [c]Filter | [s]Save", end="")
                         if SI_AVAILABLE:
@@ -10867,7 +10444,7 @@ def keyboard_listener():
                         pass
                     # ── 画面クリア後にキーガイドを再表示 ──
                     time.sleep(0.1)
-                    terminal_print("\n🎹 [r]Restart | [f]Folder | [n]Next | [b]Prev | [i]Show image | [o]Favorite | [q]Menu")
+                    terminal_print("\n🎹 [r]Restart | [f]Folder | [n]Next | [b]Prev | [i]Show image | [q]Menu")
                     _fp = FILTER_PRESET_LABELS.get(current_filter_preset, current_filter_preset)
                     _gp_l2 = {'classical': 'Classical(0dB)', 'general': 'General(-1.5dB)', 'jazz_pop': 'Pop(-3.5dB)', 'loud': 'Loud(-5dB)'}
                     terminal_print(f"🔊 [+][-]Output gain ({CURRENT_VOLUME:+d} dB) | [g]Gain ({_gp_l2.get(current_gain_preset, current_gain_preset)}) | [c]Filter ({_fp}) | [s]Save", end="")
@@ -11076,7 +10653,7 @@ def play_tracks_gapless(tracks, start_index=0):
             output_sample_rate = upsampling_target_rate
             pass  # サンプリングレート情報（情報バーに表示済み）
         else:
-            output_sample_rate = 48000 if dsp_mode_active else original_sample_rate
+            output_sample_rate = original_sample_rate
             pass  # サンプリングレート情報
         
         # FFmpegコマンドを構築
@@ -11799,7 +11376,6 @@ def interactive_mode():
         print("  N. 🆕  Recently added (cover-art browser)")  # ★★★ 追加: 最新アルバム ★★★
         print("  R. 📻 Radio stations")  # ★★★ 追加: ラジオ ★★★
         print("  P. 💾 Preset management")  # ★★★ 追加 ★★★
-        print(f"  K. ⭐ Favorites ({len(load_favorites())} tracks)")  # ★★★ Favorites feature ★★★
         print("  A. 🎚️ Audio preset")
         print("  G. 🎛️ Gain preset")
         print("  L. 🔊 Loudness normalisation")  # ★★★ 追加 ★★★
@@ -11824,7 +11400,7 @@ def interactive_mode():
         print("💡 Press [q] during playback to return to this menu")
 
         try:
-            choice = input("\nChoice (0-9, J, N, M, R, P, K, A, G, L, T, W, V, F, E, Z, U, QB, S, Y, AP, DL, X, Q): ").strip().lower()
+            choice = input("\nChoice (0-9, J, N, M, R, P, A, G, L, T, W, V, F, E, Z, U, QB, S, Y, AP, DL, X, Q): ").strip().lower()
 
             if choice == '0':
                 print("\n🎵 Random shuffle mode — all tracks")
@@ -12549,10 +12125,6 @@ def interactive_mode():
 
             elif choice == 'p':  # ★★★ プリセット管理 ★★★
                 preset_management_menu()
-                continue
-
-            elif choice == 'k':  # ★★★ Favorites ★★★
-                favorites_menu()
                 continue
 
             elif choice == 'qb':

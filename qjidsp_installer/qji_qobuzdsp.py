@@ -547,18 +547,6 @@ def _update_now_playing(track: dict, state: dict, elapsed: int = 0):
         # ジャケット画像をダウンロード
         jacket_path = _download_jacket(track.get('cover_url', ''))
 
-        # ★★★ 修正: ジャケットバッジ表示用に qji.py 側の current_filter_preset /
-        # current_gain_preset を「今この曲で実際に使っているプリセット」に確定させておく。
-        # _get_filter_args() は音声フィルター構築のためだけに一時的にこれらを書き換えて
-        # すぐ元の値へ戻す(finallyで復元)ため、その後に呼ばれるバッジ表示がそのままだと
-        # 巻き戻った古い値（前の曲やローカル再生時の値）を読んでしまい、実際のプリセット
-        # と表示がズレる不具合があった。
-        try:
-            _qji.current_filter_preset = state.get('filter_preset', 'musikverein')
-            _qji.current_gain_preset   = state.get('gain_preset', 'classical')
-        except Exception:
-            pass
-
         # デスクトップ: 曲情報付きジャケット（新曲に変わったら自動表示）
         # ESC で非表示中（_feh_hidden=True）の場合は表示しない
         if jacket_path and not _feh_hidden:
