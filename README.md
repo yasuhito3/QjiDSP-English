@@ -98,10 +98,10 @@ Selecting "Loopback" as the output device lets you choose from six soundfields (
 
 ## Updating
 
-Once installed, you don't need to re-download the zip or `git clone` again each time. The installer places `update_qjidsp.sh` (plus a desktop icon for it) into `~/qji/` for you.
+Once installed, you don't need to re-download the zip or `git clone` again each time. Just like the main Qji launcher icon, the installer creates a **"QjiDSP Update Checker"** icon directly on your Desktop.
 
+- **From the desktop icon**: double-click the "QjiDSP Update Checker" icon
 - **From the terminal**: `cd ~/qji && bash update_qjidsp.sh`
-- **From the desktop icon**: double-click `~/qji/QjiDSP Update Checker.desktop`
 
 This checks this repository's `VERSION` file, and if a newer version is available, downloads it (after confirmation) and re-runs `install_qjidsp.sh` with the latest files. Any existing files that get overwritten are automatically backed up with a timestamp, per the installer's usual behavior. If you're already on the latest version, it just says so and exits.
 
@@ -175,8 +175,7 @@ speaker-test -D hw:CARD=Loopback,DEV=0 -c 2 -r 48000 -F S32_LE
 ~/qji/
 ├── qji.py                      # main app
 ├── VERSION                     # installed version (read by update_qjidsp.sh)
-├── update_qjidsp.sh            # update checker script
-├── QjiDSP Update Checker.desktop  # desktop-icon version of the above
+├── update_qjidsp.sh            # update checker script (target of the Desktop icon)
 ├── qji_qobuzdsp.py             # Qobuz module
 ├── qji_qobuz_browser.py        # Qobuz browser UI
 ├── qji_soundcloud.py           # SoundCloud module

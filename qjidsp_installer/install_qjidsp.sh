@@ -349,14 +349,40 @@ if [ -f "$SCRIPT_DIR/update_qjidsp.sh" ]; then
     cp "$SCRIPT_DIR/update_qjidsp.sh" "$QJI_DIR/update_qjidsp.sh"
     chmod +x "$QJI_DIR/update_qjidsp.sh"
 fi
-if [ -f "$SCRIPT_DIR/QjiDSP Update Checker.desktop" ]; then
-    cp "$SCRIPT_DIR/QjiDSP Update Checker.desktop" "$QJI_DIR/QjiDSP Update Checker.desktop"
-    chmod +x "$QJI_DIR/QjiDSP Update Checker.desktop"
-    if command -v gio >/dev/null 2>&1; then
-        gio set "$QJI_DIR/QjiDSP Update Checker.desktop" "metadata::trusted" true >/dev/null 2>&1 || true
-    fi
+
+# --- Create a "QjiDSP Update Checker" desktop icon ---
+# Just like the main Qji launcher icon, generate a .desktop file with
+# the absolute path baked in, directly on the user's Desktop. Shipping
+# a static file with a relative Exec (and copying it as-is) depends on
+# the file manager setting its working directory to the file's own
+# folder, which isn't consistent across distros/file managers — baking
+# in the absolute path we already know at install time avoids that.
+UPDATE_DESKTOP_DIR="$(xdg-user-dir DESKTOP 2>/dev/null)"
+[ -z "$UPDATE_DESKTOP_DIR" ] && UPDATE_DESKTOP_DIR="$HOME/Desktop"
+mkdir -p "$UPDATE_DESKTOP_DIR"
+
+UPDATE_DESKTOP_FILE="$UPDATE_DESKTOP_DIR/QjiDSP Update Checker.desktop"
+cat > "$UPDATE_DESKTOP_FILE" <<EOF
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=QjiDSP Update Checker
+Name[en]=QjiDSP Update Checker
+GenericName=QjiDSP Update Checker
+Comment=Checks GitHub for a newer version and updates QjiDSP if available
+Exec=bash "${QJI_DIR}/update_qjidsp.sh"
+Icon=system-software-update
+Terminal=true
+StartupNotify=false
+Categories=System;Utility;
+Keywords=Qji;QjiDSP;CamillaDSP;update;
+EOF
+chmod +x "$UPDATE_DESKTOP_FILE"
+if command -v gio >/dev/null 2>&1; then
+    gio set "$UPDATE_DESKTOP_FILE" "metadata::trusted" true >/dev/null 2>&1 || true
 fi
-ok "Placed VERSION / the update script / the update-checker icon"
+
+ok "Placed VERSION / the update script, and created the \"QjiDSP Update Checker\" desktop icon"
 
 # -------------------------------------------------------------
 # Step 7: Check the desktop icon
@@ -424,7 +450,7 @@ echo "  deno's PATH has been added to ~/.bashrc."
 echo "  Open a new terminal, or run 'source ~/.bashrc', for it to take effect."
 echo ""
 echo "  Checking for updates:"
-echo "    cd ${QJI_DIR} && bash update_qjidsp.sh"
-echo "    (or double-click ${QJI_DIR}/QjiDSP Update Checker.desktop)"
+echo "    double-click the \"QjiDSP Update Checker\" icon on your Desktop"
+echo "    (or from the terminal: cd ${QJI_DIR} && bash update_qjidsp.sh)"
 echo -e "${GREEN}${BOLD}============================================================${RESET}"
 read -rp "Press Enter to close..." _
