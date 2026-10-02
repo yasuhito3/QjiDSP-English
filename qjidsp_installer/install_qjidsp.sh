@@ -80,6 +80,7 @@ echo "  4. Install deno (used to stabilize YouTube Music playback)"
 echo "  5. Set up the virtual sound card (snd-aloop)"
 echo "  6. Place the full Qji app + DSP files (soundfields v1-v6) into ${QJI_DIR}/"
 echo "  7. Update existing files to the DSP-enabled version (old versions are auto-backed up)"
+echo "  8. Set up the USB output digital-noise mitigation (USB-Noise-Guard) (optional, needs root)"
 echo ""
 read -rp "Continue? [Y/n] " answer
 case "$answer" in
@@ -260,6 +261,9 @@ backup_and_install "qji_soundcloud.py"
 backup_and_install "qji_soundcloud_browser.py"
 backup_and_install "qji_ytmusic.py"
 backup_and_install "qji_ytmusic_browser.py"
+backup_and_install "usb_noise_guard.py"
+backup_and_install "install_usb_audio_optimize.sh"
+backup_and_install "usb_noise_guard.py"
 
 # Stale bytecode cache can prevent changes from taking effect
 if [ -d "$QJI_DIR/__pycache__" ]; then
@@ -385,7 +389,42 @@ fi
 ok "Placed VERSION / the update script, and created the \"QjiDSP Update Checker\" desktop icon"
 
 # -------------------------------------------------------------
-# Step 7: Check the desktop icon
+# Step 7: Set up USB output digital-noise mitigation (USB-Noise-Guard)
+# -------------------------------------------------------------
+# Disabling USB autosuspend and granting realtime priority both require
+# an OS-level, one-time setup (creating a udev rule, granting
+# permissions to the `audio` group), which needs root. It auto-detects
+# the connected USB DAC, so it needs to run with the DAC plugged in.
+# A failure here shouldn't abort the whole install, so the `sudo bash
+# ...` result is captured in an `if` so `set -e` doesn't trip on it.
+step "Setting up USB output digital-noise mitigation (USB-Noise-Guard)"
+
+if [ -f "$QJI_DIR/install_usb_audio_optimize.sh" ]; then
+    chmod +x "$QJI_DIR/install_usb_audio_optimize.sh"
+    echo ""
+    echo "Mitigating USB output digital noise (disabling USB autosuspend + granting"
+    echo "realtime priority) needs a one-time OS-level setup with root privileges"
+    echo "(it auto-detects your connected USB DAC and creates a udev rule for it)."
+    read -rp "Set this up now? (make sure your USB DAC is connected) [Y/n] " usb_answer
+    case "$usb_answer" in
+        [nN]*)
+            warn "Skipped. You can run it manually later: sudo bash ${QJI_DIR}/install_usb_audio_optimize.sh"
+            ;;
+        *)
+            if sudo bash "$QJI_DIR/install_usb_audio_optimize.sh"; then
+                ok "USB-Noise-Guard setup complete (log out and back in once for it to fully take effect)"
+            else
+                warn "USB-Noise-Guard setup did not complete. Please run it manually later:"
+                warn "  sudo bash ${QJI_DIR}/install_usb_audio_optimize.sh"
+            fi
+            ;;
+    esac
+else
+    warn "install_usb_audio_optimize.sh was not found in the bundled package. Skipping USB-Noise-Guard setup."
+fi
+
+# -------------------------------------------------------------
+# Step 8: Check the desktop icon
 # -------------------------------------------------------------
 step "Checking the desktop icon"
 
@@ -403,7 +442,7 @@ fi
 # -------------------------------------------------------------
 step "Verification"
 
-for pyfile in qji.py qji_qobuzdsp.py qji_qobuz_browser.py qji_soundcloud.py qji_soundcloud_browser.py qji_ytmusic.py qji_ytmusic_browser.py; do
+for pyfile in qji.py qji_qobuzdsp.py qji_qobuz_browser.py qji_soundcloud.py qji_soundcloud_browser.py qji_ytmusic.py qji_ytmusic_browser.py usb_noise_guard.py; do
     if [ -f "$QJI_DIR/$pyfile" ]; then
         python3 -c "import ast; ast.parse(open('$QJI_DIR/$pyfile').read())" \
             && ok "$pyfile syntax OK" \
@@ -445,6 +484,11 @@ echo "    5) Harmonics mode             6) Harmonics mode (for headphones)"
 echo ""
 echo "  Your DAC (audio interface) can be auto-detected and selected"
 echo "  right after choosing a DSP mode."
+echo ""
+echo "  USB output digital-noise mitigation (USB-Noise-Guard):"
+echo "    During playback, use u (toggle both) / k (autosuspend mitigation only) /"
+echo "    j (RT-priority mitigation only) / m (show status) for live A/B comparison."
+echo "    If you skipped the setup, run it later: sudo bash ${QJI_DIR}/install_usb_audio_optimize.sh"
 echo ""
 echo "  deno's PATH has been added to ~/.bashrc."
 echo "  Open a new terminal, or run 'source ~/.bashrc', for it to take effect."

@@ -77,6 +77,30 @@ except Exception as _si_e:
     print(f"⚠️  Sonia Intelligence System: disabled ({_si_e})")
 # ===== ★★★ Sonia Intelligence System ここまで ★★★ =====
 
+# ===== ★★★ USB Output Digital-Noise Mitigation System ★★★ =====
+try:
+    from usb_noise_guard import (
+        optimize_usb_audio_output, card_num_from_alsa_device, toggle_usb_audio_output,
+        toggle_autosuspend_guard, toggle_rtprio_guard, format_guard_status,
+    )
+    USB_NOISE_GUARD_AVAILABLE = True
+except Exception as _ung_e:
+    USB_NOISE_GUARD_AVAILABLE = False
+    def optimize_usb_audio_output(*_a, **_kw):  # fallback (never blocks playback if absent)
+        return None
+    def card_num_from_alsa_device(_s):
+        return None
+    def toggle_usb_audio_output(*_a, **_kw):
+        return None
+    def toggle_autosuspend_guard(*_a, **_kw):
+        return None
+    def toggle_rtprio_guard(*_a, **_kw):
+        return None
+    def format_guard_status(*_a, **_kw):
+        return "🔌 USB noise guard: unavailable"
+    print(f"⚠️  USB output digital-noise mitigation system: disabled ({_ung_e})")
+# ===== ★★★ USB Output Digital-Noise Mitigation System end ★★★ =====
+
 # Webサーバー用インポート
 try:
     from http.server import HTTPServer, SimpleHTTPRequestHandler
@@ -288,6 +312,15 @@ stop_playback = False
 current_processes = {'ffmpeg': None, 'aplay': None, 'feh': None}
 output_device = 'hw:2,0'
 dsp_mode_active = False  # DSPモード時はTrue（48000Hz固定）
+current_dsp_venue = None  # ★ Live [1]-[6] key switching: currently active DSP mode (v1-v6). Set at startup selection / by switch_dsp_venue()
+DSP_VENUE_LABELS = {
+    '1': '🏛️ Rich hall (still)',
+    '2': '🏛️ Rich hall (moving)',
+    '3': '🎙️ Natural tone (still)',
+    '4': '🎙️ Natural tone (moving)',
+    '5': '🎻 Harmonics mode',
+    '6': '🎧 Harmonics mode (HP)',
+}  # ★ Labels for the cover-art badge (matches the startup DSP mode menu wording)
 current_playing_track = None
 current_image_path = None
 next_track_requested = False
@@ -3279,6 +3312,40 @@ def create_cover_with_info(image_path, track_info):
         except Exception:
             pass  # プリセットバッジ生成失敗は無視して通常画像を使用
         
+        # ★★★ Sound-field badge (top-left, 2nd row): shows the active DSP mode (v1-v6) ★★★
+        try:
+            if current_dsp_venue:
+                _venue_badge_label = DSP_VENUE_LABELS.get(current_dsp_venue, f"v{current_dsp_venue}")
+                _venue_badge_text = f"🎧 {_venue_badge_label}"
+
+                venue_badge_path = os.path.join(temp_dir, "venue_badge.png")
+                venue_badge_cmd = [
+                    'convert',
+                    '-size', '320x48',
+                    'xc:none',
+                    '-fill', 'rgba(10,10,10,0.82)',
+                    '-draw', 'roundrectangle 0,0 319,47 12,12',
+                    '-font', jp_font,
+                    '-pointsize', '17',
+                    '-fill', '#ffffff',
+                    '-gravity', 'Center',
+                    '-annotate', '+0+0', _venue_badge_text,
+                    venue_badge_path
+                ]
+                subprocess.run(venue_badge_cmd, capture_output=True, check=True, timeout=5)
+                if os.path.exists(venue_badge_path):
+                    venue_composite_cmd = [
+                        'convert', output_path,
+                        venue_badge_path,
+                        '-gravity', 'NorthWest',
+                        '-geometry', '+12+68',  # ★ Placed directly below the preset badge (48px height + 12px top margin)
+                        '-composite',
+                        output_path
+                    ]
+                    subprocess.run(venue_composite_cmd, capture_output=True, check=True, timeout=5)
+        except Exception:
+            pass  # If the sound-field badge fails to render, just use the plain image
+        
         return output_path if os.path.exists(output_path) else image_path
     
     except Exception as e:
@@ -3384,6 +3451,142 @@ def shutdown_dsp():
     setattr(_bi_cleanup, '_cdsp_proc', None)
     setattr(_bi_cleanup, '_wobble_proc', None)
     setattr(_bi_cleanup, '_watchdog_proc', None)
+
+
+def switch_dsp_venue(dsp_choice):
+    """
+    ★ Live-switch the DSP mode (v1-v6) during playback with the [1]-[6] keys.
+
+    Uses the same _yml_map / _wobble_map as the startup DSP selection,
+    restarting CamillaDSP and wobble in place. The current DAC output
+    (device/format) is carried over unchanged into the new YAML, so only
+    the sound field changes — the output destination doesn't need to be
+    reselected. The ffmpeg->aplay audio pipeline is never touched, so the
+    currently playing track keeps playing without a restart.
+
+    Returns True on success, False on failure.
+    """
+    global current_dsp_venue
+    try:
+        return _switch_dsp_venue_impl(dsp_choice)
+    except Exception as _e:
+        # ★★★ Last line of defense ★★★
+        # If this exception isn't caught here, it would break out of
+        # keyboard_listener()'s while loop and kill the whole thread,
+        # leaving the keyboard completely unresponsive.
+        terminal_print(f"❌ Unexpected error while switching DSP mode: {_e}")
+        terminal_print("💡 Playback continues. If DSP is left in an unstable state, restart Qji.")
+        return False
+
+
+def _switch_dsp_venue_impl(dsp_choice):
+    """Actual implementation for switch_dsp_venue(). May raise — the caller
+    (switch_dsp_venue()) must always wrap this in try/except."""
+    global current_dsp_venue
+    _HOME = os.path.expanduser("~")
+    _live_yml = f'{_HOME}/camilladsp_test/spatial_final.yml'
+
+    # ★ Same mapping as the startup DSP mode menu (v1-v6 only)
+    _yml_map = {
+        '1': f'{_HOME}/qjidsp_backup_v1/spatial_final.yml',
+        '2': f'{_HOME}/qjidsp_backup_v2/spatial_final.yml',
+        '3': f'{_HOME}/qjidsp_backup_v3/spatial_final.yml',
+        '4': f'{_HOME}/qjidsp_backup_v4/spatial_final.yml',
+        '5': f'{_HOME}/qjidsp_backup_v5/spatial_final.yml',
+        '6': f'{_HOME}/qjidsp_backup_v6/spatial_final.yml',
+    }
+    _wobble_map = {
+        '1': f'{_HOME}/camilladsp_test/wobble_v1.py',
+        '2': f'{_HOME}/camilladsp_test/wobble_v2.py',
+        '3': f'{_HOME}/camilladsp_test/wobble_v3_static.py',
+        '4': f'{_HOME}/camilladsp_test/wobble_v4.py',
+        '5': f'{_HOME}/camilladsp_test/wobble_v5.py',
+        '6': f'{_HOME}/camilladsp_test/wobble_v5_harmonics_hp.py',
+    }
+
+    if dsp_choice not in _yml_map:
+        terminal_print(f"⚠️ Unknown DSP mode requested: {dsp_choice}")
+        return False
+
+    # ★ Save the currently active DAC output (device/format lines) before switching
+    _current_device_line = None
+    _current_format_line = None
+    try:
+        with open(_live_yml, 'r') as _yf:
+            _lines = _yf.readlines()
+        _in_playback = False
+        for _line in _lines:
+            _stripped = _line.strip()
+            if _stripped == 'playback:':
+                _in_playback = True
+            elif _stripped.startswith('capture:') or _stripped.startswith('mixers:') or _stripped.startswith('filters:') or _stripped.startswith('pipeline:'):
+                _in_playback = False
+            if _in_playback and _stripped.startswith('device:') and _current_device_line is None:
+                _current_device_line = _line
+            if _in_playback and _stripped.startswith('format:') and _current_format_line is None:
+                _current_format_line = _line
+    except Exception as _e:
+        terminal_print(f"⚠️ Failed to read the current DAC settings: {_e}")
+
+    terminal_print(f"\n🎛️ Switching to DSP v{dsp_choice}...")
+    shutdown_dsp()
+
+    try:
+        with open(_yml_map[dsp_choice], 'r', encoding='utf-8') as _f_src:
+            _yml_content = _f_src.read()
+        _yml_content = _yml_content.replace('{HOME}', _HOME)
+
+        # ★ Carry the saved DAC device/format settings over into the new mode's YAML
+        if _current_device_line or _current_format_line:
+            _new_lines2 = []
+            _in_playback2 = False
+            for _line in _yml_content.splitlines(keepends=True):
+                _stripped2 = _line.strip()
+                if _stripped2 == 'playback:':
+                    _in_playback2 = True
+                elif _stripped2.startswith('capture:') or _stripped2.startswith('mixers:') or _stripped2.startswith('filters:') or _stripped2.startswith('pipeline:'):
+                    _in_playback2 = False
+                if _in_playback2 and _stripped2.startswith('device:') and _current_device_line:
+                    _new_lines2.append(_current_device_line)
+                    continue
+                if _in_playback2 and _stripped2.startswith('format:') and _current_format_line:
+                    _new_lines2.append(_current_format_line)
+                    continue
+                _new_lines2.append(_line)
+            _yml_content = ''.join(_new_lines2)
+
+        with open(_live_yml, 'w', encoding='utf-8') as _f_dst:
+            _f_dst.write(_yml_content)
+    except Exception as _e:
+        terminal_print(f"❌ Failed to rewrite the YAML config: {_e}")
+        return False
+
+    import builtins as _bi4
+    _cdsp_log = open('/tmp/camilladsp.log', 'w')
+    _bi4._cdsp_proc = subprocess.Popen(
+        ['camilladsp', _live_yml, '--port', '1234'],
+        stdout=_cdsp_log, stderr=_cdsp_log
+    )
+    time.sleep(3.0)
+
+    _wobble_log = open('/tmp/wobble.log', 'w')
+    _wobble_path = _wobble_map[dsp_choice]
+    _bi4._wobble_proc = subprocess.Popen(
+        ['python3', _wobble_path],
+        stdout=_wobble_log, stderr=_wobble_log
+    )
+    _bi4._wobble_script_path = _wobble_path
+    time.sleep(1.0)
+
+    _watchdog_log = open('/tmp/cdsp_watchdog.log', 'w')
+    _bi4._watchdog_proc = subprocess.Popen(
+        ['python3', f'{_HOME}/camilladsp_test/cdsp_watchdog.py'],
+        stdout=_watchdog_log, stderr=_watchdog_log
+    )
+
+    current_dsp_venue = dsp_choice
+    terminal_print(f"✅ Switched to DSP v{dsp_choice}")
+    return True
 
 
 def _scan_dac_list():
@@ -3574,6 +3777,14 @@ def reinitialize_dsp_output():
     else:
         _bi3._wobble_proc = None
         print("⚠️ Couldn't locate the wobble script, so wobble was not started (the sound field itself will still play)")
+
+    # ★★★ USB output digital-noise mitigation (disable autosuspend + grant RT priority) ★★★
+    _usb_cnum = card_num_from_alsa_device(_dac_device)
+    if _usb_cnum is not None:
+        _extra_pids = [_bi3._cdsp_proc.pid]
+        if _bi3._wobble_proc is not None:
+            _extra_pids.append(_bi3._wobble_proc.pid)
+        optimize_usb_audio_output(_usb_cnum, extra_pids=_extra_pids)
 
     print(f"✅ DSP restarted. New output: {_dac_device}")
 
@@ -10026,7 +10237,7 @@ def play_one_track(track, show_controls=True):
         terminal_print(f"   Mood: {color}{emoji} {mood_en}{reset}")
     
     if show_controls:
-        terminal_print("🎹 [r]Restart | [f]Play folder in order | [n]Next | [b]Prev | [i]Show image again | [o]Add to favorites | [ ][ [ ]Volume | [v]Volume ON/OFF | [q]Quit to menu")
+        terminal_print("🎹 [r]Restart | [f]Play folder in order | [n]Next | [b]Prev | [i]Show image again | [o]Add to favorites | [ ][ [ ]Volume | [v]Volume ON/OFF | [1-6]Sound field (DSP) | [u/k/j/m]USB noise guard (all/AS/RT/status) | [q]Quit to menu")
         _gp_labels = {'classical': 'Classical(0dB)', 'general': 'General(-1.5dB)', 'jazz_pop': 'Pop(-3.5dB)', 'loud': 'Loud(-5dB)'}
         terminal_print(f"🔊 [+][-]Output gain ({CURRENT_VOLUME:+d} dB) | [g]Input gain ({_gp_labels.get(current_gain_preset, current_gain_preset)}) | [c]Filter | [s]Save", end="")
         if SI_AVAILABLE:
@@ -10648,6 +10859,60 @@ def _sync_profile_to_memory(profile: dict, file_path: str = None,
         pass
 
 
+def _redisplay_current_cover() -> bool:
+    """
+    Re-display the currently playing track's cover art (with the info
+    overlay), used right after saving an audio profile with [s].
+
+    Playback itself is never touched here (no ffmpeg/aplay calls) — only the
+    cover window is redrawn — so audio keeps playing gaplessly and the track
+    doesn't restart. Returns True if a cover was shown, False otherwise
+    (e.g. no artwork found for this track).
+    """
+    try:
+        track_path = None
+        if current_playing_track and current_playing_track.get('path'):
+            track_path = current_playing_track.get('path')
+        if not track_path:
+            with info_display_lock:
+                track_path = current_track_info.copy().get('file_path')
+        if not track_path:
+            return False
+
+        image_path = find_cover_image_safe(track_path)
+        if not image_path:
+            return False
+
+        with info_display_lock:
+            _ti_copy = current_track_info.copy()
+
+        _feh = current_processes.get('feh')
+        if _feh and _feh.poll() is None:
+            try:
+                _feh.terminate()
+                _feh.wait(timeout=1)
+            except Exception:
+                try:
+                    _feh.kill()
+                except Exception:
+                    pass
+
+        current_processes['feh'] = show_cover_image_with_info(image_path, _ti_copy)
+        # NOTE: current_image_path is already set correctly inside
+        # show_cover_image_with_info() (to the composited image with the
+        # info overlay). Do NOT overwrite it here with the raw image_path —
+        # doing so used to make the later [i] (redisplay) key show the plain
+        # jacket with no info overlay, since show_cover_image() just
+        # redisplays whatever current_image_path currently points to.
+        return bool(current_processes['feh'])
+    except Exception as e:
+        try:
+            terminal_print(f"⚠️ Failed to redisplay cover art: {e}")
+        except Exception:
+            pass
+        return False
+
+
 def _do_save_profile():
     """
     [s]キー: 現在の全音響設定を音源プロファイルとして保存。
@@ -10706,6 +10971,8 @@ def _do_save_profile():
 
         choice = _si_readline("  Select (1/2): ").strip()
 
+        _saved_ok = False  # if the save succeeds, return to the cover automatically
+
         if choice == '1':
             if not file_path:
                 with terminal_io_lock:
@@ -10714,6 +10981,7 @@ def _do_save_profile():
                 ok = _save_audio_profile_to_track(file_path, profile)
                 if ok:
                     _sync_profile_to_memory(profile, file_path=file_path)
+                    _saved_ok = True
                 with terminal_io_lock:
                     if ok:
                         print(f"\n  ✅ Profile saved for '{title[:40]}'")
@@ -10725,6 +10993,7 @@ def _do_save_profile():
             updated = _save_audio_profile_to_db(album, folder, profile)
             if updated > 0:
                 _sync_profile_to_memory(profile, album=album, folder=folder)
+                _saved_ok = True
             with terminal_io_lock:
                 if updated > 0:
                     tgt = album or os.path.basename(folder) or 'Unknown'
@@ -10737,7 +11006,21 @@ def _do_save_profile():
             with terminal_io_lock:
                 print("  Cancelled")
 
-        _si_readline("  [Press Enter to resume] ")
+        # ★★★ On a successful save, skip the Enter prompt and go straight back
+        #     to the cover art. Playback was never actually paused, so the old
+        #     "[Press Enter to resume]" prompt did nothing useful and never
+        #     brought the cover back either. ★★★
+        if _saved_ok:
+            with terminal_io_lock:
+                print("\n  🖼️  Returning to cover art...")
+                sys.stdout.flush()
+            time.sleep(0.4)
+            if not _redisplay_current_cover():
+                with terminal_io_lock:
+                    print("  ℹ️  No cover art found (playback continues).")
+                    sys.stdout.flush()
+        else:
+            _si_readline("  [Press Enter to return] ")
     finally:
         _si_display_event.set()
 
@@ -11065,6 +11348,35 @@ def keyboard_listener():
                     terminal_print(f"\n🎚️  Input gain preset: {_gain_labels[current_gain_preset]}  ([g] cycle / [s] save)")
                     replay_requested = True  # 現在曲に即反映
 
+                elif key in ('1', '2', '3', '4', '5', '6'):
+                    # ★★★ [1]-[6] switch the DSP mode directly, in place ★★★
+                    if dsp_mode_active:
+                        if switch_dsp_venue(key):
+                            # ★ Playback (ffmpeg->aplay) is never touched — only the cover-art
+                            #   badge is redrawn for the new DSP mode (no restart of the track).
+                            _redisplay_current_cover()
+                    else:
+                        terminal_print("\n⚠️ DSP mode switching isn't available because Qji wasn't started in DSP mode (select Loopback at startup to enable it)")
+
+                elif key == 'u':
+                    # ★★★ [u] Toggle both USB output digital-noise mitigations together (A/B comparison) ★★★
+                    toggle_usb_audio_output()
+                    terminal_print(format_guard_status())
+
+                elif key == 'k':
+                    # ★★★ [k] Toggle the autosuspend mitigation only (isolate the cause) ★★★
+                    toggle_autosuspend_guard()
+                    terminal_print(format_guard_status())
+
+                elif key == 'j':
+                    # ★★★ [j] Toggle the RT-priority mitigation only (isolate the cause) ★★★
+                    toggle_rtprio_guard()
+                    terminal_print(format_guard_status())
+
+                elif key == 'm':
+                    # ★★★ [m] Show the current USB noise-guard status (reads the actual system state) ★★★
+                    terminal_print("\n" + format_guard_status())
+
                 elif key == 's':
                     # ★★★ [s] 現在の全音響設定をプロファイルとして保存 ★★★
                     _do_save_profile()
@@ -11072,7 +11384,7 @@ def keyboard_listener():
                     # 画面クリア後にコントロール表示を再描画
                     try:
                         time.sleep(0.1)
-                        terminal_print("\n🎹 [r]Restart | [f]Folder | [n]Next | [b]Prev | [i]Show image | [o]Favorite | [ ][ [ ]Volume | [v]Vol ON/OFF | [q]Menu")
+                        terminal_print("\n🎹 [r]Restart | [f]Folder | [n]Next | [b]Prev | [i]Show image | [o]Favorite | [ ][ [ ]Volume | [v]Vol ON/OFF | [1-6]DSP | [u/k/j/m]USB noise | [q]Menu")
                         _gp_l = {'classical': 'Classical(0dB)', 'general': 'General(-1.5dB)', 'jazz_pop': 'Pop(-3.5dB)', 'loud': 'Loud(-5dB)'}
                         terminal_print(f"🔊 [+][-]Output gain ({CURRENT_VOLUME:+d} dB) | [g]Gain ({_gp_l.get(current_gain_preset, current_gain_preset)}) | [c]Filter | [s]Save", end="")
                         if SI_AVAILABLE:
@@ -11083,7 +11395,7 @@ def keyboard_listener():
                         pass
                     # ── 画面クリア後にキーガイドを再表示 ──
                     time.sleep(0.1)
-                    terminal_print("\n🎹 [r]Restart | [f]Folder | [n]Next | [b]Prev | [i]Show image | [o]Favorite | [ ][ [ ]Volume | [v]Vol ON/OFF | [q]Menu")
+                    terminal_print("\n🎹 [r]Restart | [f]Folder | [n]Next | [b]Prev | [i]Show image | [o]Favorite | [ ][ [ ]Volume | [v]Vol ON/OFF | [1-6]DSP | [u/k/j/m]USB noise | [q]Menu")
                     _fp = FILTER_PRESET_LABELS.get(current_filter_preset, current_filter_preset)
                     _gp_l2 = {'classical': 'Classical(0dB)', 'general': 'General(-1.5dB)', 'jazz_pop': 'Pop(-3.5dB)', 'loud': 'Loud(-5dB)'}
                     terminal_print(f"🔊 [+][-]Output gain ({CURRENT_VOLUME:+d} dB) | [g]Gain ({_gp_l2.get(current_gain_preset, current_gain_preset)}) | [c]Filter ({_fp}) | [s]Save", end="")
@@ -11295,8 +11607,18 @@ def create_concat_file_for_gapless(tracks, temp_dir):
         for track in tracks:
             track_path = track.get('path', '')
             if os.path.exists(track_path):
-                # ファイルパスにシングルクォートが含まれる場合のエスケープ
-                safe_path = track_path.replace("'", "\'\''")
+                # ★★★ Fixed single-quote escaping ★★★
+                # Previously replaced "'" with "'''" (three quotes), which is
+                # NOT valid escaping for ffmpeg's concat file format. The
+                # correct escape is close-quote + backslash-escaped-quote +
+                # open-quote, i.e. "'\''" (4 characters). With the old,
+                # incorrect "'''" escaping, any track whose filename contains
+                # an apostrophe (e.g. an Italian tempo marking like
+                # "L'istesso tempo") would have its path silently truncated
+                # by ffmpeg's concat parser, causing ffmpeg to fail to open
+                # the next file and the whole gapless stream to end right
+                # after the previous track — with no error shown to the user.
+                safe_path = track_path.replace("'", "'\\''")
                 f.write(f"file '{safe_path}'\n")
 
     return concat_file_path
@@ -11931,6 +12253,9 @@ def select_output_device_interactive():
             chosen = devices[raw]
             output_device = chosen['hw']
             print(f"✅ Output device: {output_device}  ({chosen['name']})")
+            _usb_cnum = card_num_from_alsa_device(output_device)
+            if _usb_cnum is not None:
+                optimize_usb_audio_output(_usb_cnum)
             return output_device
         print("⚠️ Please enter a valid number")
 
@@ -11938,6 +12263,9 @@ def select_output_device_interactive():
         print(f"✅ Auto-selected the default DSP output card, hw:2,0")
     else:
         print(f"✅ Keeping device: {output_device}")
+    _usb_cnum = card_num_from_alsa_device(output_device)
+    if _usb_cnum is not None:
+        optimize_usb_audio_output(_usb_cnum)
     return output_device
 
 
@@ -13074,9 +13402,18 @@ if __name__ == "__main__":
                 _time.sleep(1.0)
                 print(f"🎛️  DSP v{_dsp_choice} started")
                 dsp_mode_active = True
+                current_dsp_venue = _dsp_choice  # ★ Initial value for the cover-art badge and [1-6] switching
                 # ★ CamillaDSP/wobbleはここで一度だけ起動する常駐プロセス。
                 #   プログラム終了時にのみ確実に停止させる（途中のcleanup_processes()では止めない）
                 atexit.register(shutdown_dsp)
+
+                # ★★★ USB output digital-noise mitigation (disable autosuspend + grant RT priority) ★★★
+                _usb_cnum = card_num_from_alsa_device(_dac_device)
+                if _usb_cnum is not None:
+                    optimize_usb_audio_output(
+                        _usb_cnum,
+                        extra_pids=[_bi._cdsp_proc.pid, _bi._wobble_proc.pid]
+                    )
 
         # ★★★ 起動時マイク設定（--no-voice 未指定時のみ） ★★★
         if args.voice:
