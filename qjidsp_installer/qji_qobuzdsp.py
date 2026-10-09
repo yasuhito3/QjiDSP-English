@@ -7,6 +7,8 @@ qji.py から Q キーで呼び出される。
   [n]次  [b]前  [q]メニューへ
   [g]ゲイン切替  [G]ギャップレス ON/OFF  [w]APL ON/OFF  [c]プリセット選択
   [+]/[=]音量+1dB  [-]音量-1dB
+  [0] DSP bypass (pass-through) ON/OFF  [1]-[6] DSP venue switch (DSP mode only; uses qji.py's functions)
+  [u]/[k]/[j] toggle the USB noise guard (all / autosuspend / RT priority)  [m] show state (y also works) (uses qji.py's functions)
   [s]音響設定を保存
 """
 
@@ -81,6 +83,50 @@ def _is_dsp_mode_active() -> bool:
         return bool(getattr(main_mod, 'dsp_mode_active', False))
     except Exception:
         return False
+
+
+def _switch_dsp_venue_via_main(key: str) -> Optional[bool]:
+    """
+    Switch the DSP venue (v1-v6) through switch_dsp_venue() of the caller (qji.py = __main__).
+    Returns True = switched / False = failed / None = already on that venue (nothing done)
+    """
+    main_mod = sys.modules.get('__main__')
+    # [0] = toggle DSP bypass (pass-through), [1]-[6] = switch venue
+    fn = getattr(main_mod, 'toggle_dsp_bypass' if key == '0' else 'switch_dsp_venue', None)
+    if not callable(fn):
+        print('  ⚠ DSP switch function not found (was this launched from qji.py?)')
+        return False
+    if key != '0' and getattr(main_mod, 'current_dsp_venue', None) == key:
+        return None
+    return bool(fn() if key == '0' else fn(key))
+
+
+def _usb_guard_summary_via_main() -> str:
+    """Return the current USB noise-guard state as text, via _usb_guard_summary() of qji.py (__main__)."""
+    try:
+        fn = getattr(sys.modules.get('__main__'), '_usb_guard_summary', None)
+        return fn() if callable(fn) else '?'
+    except Exception:
+        return '?'
+
+
+def _usb_guard_action(key: str) -> None:
+    """[u] both / [k] autosuspend only / [j] RT priority only: toggle ON/OFF; [m]/[y] only show the state.
+    The real work is done by the functions on the qji.py (__main__) side (usb_noise_guard integration)."""
+    main_mod = sys.modules.get('__main__')
+    if key in ('u', 'k', 'j'):
+        names = {'u': 'toggle_usb_audio_output', 'k': 'toggle_autosuspend_guard', 'j': 'toggle_rtprio_guard'}
+        labels = {'u': 'USB output noise guard', 'k': 'USB autosuspend guard only', 'j': 'Real-time priority guard only'}
+        fn = getattr(main_mod, names[key], None)
+        if not callable(fn):
+            print('  ⚠ USB noise-guard function not found (was this launched from qji.py?)')
+            return
+        new_state = fn()
+        if new_state is True:
+            print(f'\n🔌 {labels[key]}: ON')
+        elif new_state is False:
+            print(f'\n🔌 {labels[key]}: OFF')
+    print(f'🔌 USB noise-guard state: {_usb_guard_summary_via_main()}  (AS = autosuspend guard / RT = real-time priority)')
 
 _incognito_proc: Optional[subprocess.Popen] = None
 _incognito_tmp_dir: Optional[str] = None
@@ -546,6 +592,18 @@ def _update_now_playing(track: dict, state: dict, elapsed: int = 0):
 
         # ジャケット画像をダウンロード
         jacket_path = _download_jacket(track.get('cover_url', ''))
+
+        # ★★★ 修正: ジャケットバッジ表示用に qji.py 側の current_filter_preset /
+        # current_gain_preset を「今この曲で実際に使っているプリセット」に確定させておく。
+        # _get_filter_args() は音声フィルター構築のためだけに一時的にこれらを書き換えて
+        # すぐ元の値へ戻す(finallyで復元)ため、その後に呼ばれるバッジ表示がそのままだと
+        # 巻き戻った古い値（前の曲やローカル再生時の値）を読んでしまい、実際のプリセット
+        # と表示がズレる不具合があった。
+        try:
+            _qji.current_filter_preset = state.get('filter_preset', 'musikverein')
+            _qji.current_gain_preset   = state.get('gain_preset', 'classical')
+        except Exception:
+            pass
 
         # デスクトップ: 曲情報付きジャケット（新曲に変わったら自動表示）
         # ESC で非表示中（_feh_hidden=True）の場合は表示しない
@@ -1360,6 +1418,43 @@ def _key_listener_thread(state: dict, fd_orig_settings):
                     _save_to_favorites(state)
                     tty.setraw(fd)
 
+                elif cl in ('u', 'k', 'j', 'm', 'y'):
+                    # ★ Toggle / show the USB noise guard (uses the functions on the qji.py side).
+                    #   Leave raw mode meanwhile so printed lines are not mangled.
+                    termios.tcsetattr(fd, termios.TCSANOW, fd_orig_settings)
+                    try:
+                        _usb_guard_action(cl)
+                    finally:
+                        try:
+                            termios.tcflush(fd, termios.TCIFLUSH)
+                        except Exception:
+                            pass
+                        tty.setraw(fd)
+
+                elif cl in ('0', '1', '2', '3', '4', '5', '6'):
+                    # ★ [0]=toggle DSP bypass (pass-through), [1]-[6]=switch the DSP venue in place. Audio (ffmpeg->aplay) keeps running
+                    #   and the track is not restarted (same behaviour as the [1]-[6] keys in qji.py local playback).
+                    # Leave raw mode during the switch (~4 s) so printed lines are not mangled.
+                    termios.tcsetattr(fd, termios.TCSANOW, fd_orig_settings)
+                    if not _is_dsp_mode_active():
+                        print('\r  ⚠ DSP mode is not active (Qji was not started in DSP mode)')
+                        result = False
+                    else:
+                        result = _switch_dsp_venue_via_main(cl)
+                        if result is None:
+                            print(f'\r  ℹ Already on v{cl}')
+                    try:
+                        termios.tcflush(fd, termios.TCIFLUSH)   # discard keys buffered during the switch
+                    except Exception:
+                        pass
+                    tty.setraw(fd)
+                    # If the cover image is on screen, redraw it so the venue badge is updated
+                    if result and _feh_proc and _feh_proc.poll() is None and not _feh_hidden:
+                        _feh_show(
+                            track_info=state.get('current_track_info'),
+                            jacket_path=state.get('current_jacket_path'),
+                        )
+
                 elif cl == 'a':
                     # 自動ジャンル検出モード（手動ロックを解除して再適用）
                     try:
@@ -1773,7 +1868,7 @@ def _play_list(client: QobuzClient, tracks: List[dict],
         print(f'\n  ♫  {t.get("artist", "")} — {t.get("title", "")}{dur}')
         gapless_ind = ' 🔗GL' if state.get('gapless') else ''
         q_hint = '[q]Next PL' if state.get('playlist_queue_mode') else '[q]Stop'
-        print(f'     [n]Next [b]Prev {q_hint} [g]Gain [G]Gapless{gapless_ind} [w]APL [c]Preset [a]Auto [+/-]Vol [s]Save [i]Image [ESC]Stop')
+        print(f'     [n]Next [b]Prev {q_hint} [g]Gain [G]Gapless{gapless_ind} [w]APL [c]Preset [a]Auto [+/-]Vol [0]Bypass/[1-6]Venue [u/k/j/m]USB:{_usb_guard_summary_via_main()} [s]Save [i]Image [ESC]Stop')
 
         tid = t['track_id']
         if tid not in cached_url:

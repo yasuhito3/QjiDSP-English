@@ -2,7 +2,7 @@ import math
 import time
 from camilladsp import CamillaClient
 
-# ★★★ miniAI(QNG) フェーズ2: V5正式版(音量反応型・控えめ) ★★★
+# ★★★ miniAI(QNG) フェーズ2: V6正式版(音量反応型・控えめ、ヘッドホン用) ★★★
 # 元のwobble_v5.pyは cdsp.set_volume("wet_gain", wet) という
 # トップレベルの呼び方をしていたが、実機確認の結果 cdsp オブジェクトには
 # そのようなメソッドは存在しない(cdsp.volume.set_volume()という
@@ -25,14 +25,16 @@ def main():
     PERIOD = 60.0  # 元のwobble_v5.pyと同じ、ゆったりした周期
     UPDATE_INTERVAL = 0.20
 
-    # ★ V5は元が控えめ(固定0.15)だったため、V1/V2より可変域を小さくした
+    # V6はV5(倍音モード)にヘッドホン向けクロスフィードを加えたバリエーション。
+# 音の性格はV5と同じにしたいため、同じ可変域をそのまま採用している。
+# ★ V5は元が控えめ(固定0.15)だったため、V1/V2より可変域を小さくした
     WET_DEPTH_MIN, WET_DEPTH_MAX = 0.1, 1.0
 
     QUIET_DB = -35.0
     LOUD_DB  = -15.0
     SMOOTHING_ALPHA = 0.08
 
-    print("揺らぎLFO開始(V5: 音量反応版)...")
+    print("揺らぎLFO開始(V6: 音量反応版・ヘッドホン用)...")
 
     while True:
         try:

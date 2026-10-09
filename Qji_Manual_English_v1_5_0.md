@@ -2,6 +2,22 @@
 
 **〜 Bringing the sound of a concert hall into your room 〜**
 
+**Version 1.5.0**
+
+---
+
+## What's New in Version 1.5.0
+
+- From the home screen, the `D` key now lets you switch the DSP sound field (v1–v6).
+- During playback, the `0` key now turns DSP bypass (pass-through) ON/OFF. Press it again to return to the previous sound field.
+- Sound-field switching (`1`–`6`) and DSP bypass (`0`) now work not only with local files but also during Qobuz, radio, AirPlay, and DLNA playback.
+- The USB-Noise-Guard keys (`u` / `k` / `j`) and the status display (`m`) now work during local, Qobuz, radio, AirPlay, and DLNA playback. The status key is `m` (`y` also works).
+- During radio playback, "reset to default settings" moved from `0` to `r` (`0` is now used for DSP bypass).
+- When the files needed for a sound-field switch cannot be found, Qji now cancels the switch without interrupting playback and shows which files are missing.
+- Fixed an issue where text could drift into a staircase pattern during key operations in playback.
+
+USB-Noise-Guard requires `usb_noise_guard.py`. If the file is not found, a notice appears at startup, but playback works as usual.
+
 ---
 
 ## Table of Contents
@@ -70,6 +86,7 @@ This database is built by scanning your music folder with the bundled analysis s
 | DLNA/UPnP reception | `gmediarender`, an ALSA loopback device (`snd-aloop`) |
 | Qobuz / SoundCloud / YouTube Music playback | The corresponding modules (`qji_qobuzdsp.py`, etc.), `yt-dlp` |
 | Now Playing Mirror | A smartphone or similar browser on the same Wi-Fi network |
+| USB-Noise-Guard | `usb_noise_guard.py` (placed in the same folder as `qji.py`), a USB-connected DAC |
 
 You don't need every feature set up from day one. Qji's audio engine is already fully enjoyable with nothing more than local library playback.
 
@@ -162,6 +179,7 @@ The main menu is organized into three broad groups: **Track Selection**, **Sound
 | `Y` | 🔴 YouTube Music streaming playback |
 | `AP` | 📡 AirPlay receiver (receive from an iPhone/Mac) |
 | `DL` | 📻 UPnP/DLNA receiver (receive from BubbleUPnP, etc.) |
+| `D` | 🎛️ Switch the DSP sound field (v1–v6) (shown only when started in DSP mode) |
 | `X` | 🔄 Re-detect the DSP output device (pick up a DAC connected after startup) |
 | `Q` | Quit |
 
@@ -191,6 +209,7 @@ While a track is playing, you can control Qji in real time by pressing keys in t
 
 | Key | Action |
 |---|---|
+| `0` | ⚪ DSP bypass (pass-through) — removes the CamillaDSP sound-field processing; press again to return to the previous sound field |
 | `1` | v1 Rich Hall (Static) — full EQ chain, calm reverberation |
 | `2` | v2 Rich Hall (Dynamic) — full EQ chain, moving air |
 | `3` | v3 Taste of the Source (Static) — simple, emphasizes presence |
@@ -199,6 +218,12 @@ While a track is playing, you can control Qji in real time by pressing keys in t
 | `6` | v6 Harmonics Mode (for Headphones) — optimized for closed-/open-back headphones |
 
 These let you switch the sound field on the spot, without interrupting playback. If you selected a DAC directly at startup (bypassing DSP for the raw source sound), these keys are not available.
+
+DSP bypass (`0`) removes only the CamillaDSP sound-field processing and leaves the sound almost pass-through. Press `0` again to return to the sound field you had before. Returning restarts CamillaDSP, so it takes about 4 seconds.
+
+Keys `0`–`6` work not only with local files but also during Qobuz, radio, AirPlay, and DLNA playback. On the home screen, use the `D` key to choose a sound field.
+
+DSP bypass removes only the processing on the CamillaDSP side. To also remove the ffmpeg-side processing (such as the filter preset), also select "⚪ Bypass (No Processing)" among the filter presets. The volume may change depending on whether processing is applied, so match the volume when comparing.
 
 **Additional keys available only when Sonia Intelligence is available:**
 
@@ -217,11 +242,13 @@ These let you switch the sound field on the spot, without interrupting playback.
 | `u` | Toggle the USB output digital-noise mitigation (autosuspend disable + realtime priority, together) ON/OFF |
 | `k` | Toggle the autosuspend mitigation only ON/OFF (to isolate its effect on the noise floor during silence) |
 | `j` | Toggle the realtime-priority mitigation only ON/OFF (to isolate its effect on imaging and timing precision) |
-| `m` | Show the current ON/OFF status (does not toggle anything) |
+| `m` | Show the current ON/OFF status (does not toggle anything; `y` also works) |
 
 With a USB-connected DAC, USB autosuspend (a power-saving feature that cuts power when idle) and timing jitter from CPU contention can sometimes show up as faint clicks or subtle changes in sound quality. QjiDSP automatically mitigates both as soon as it detects your DAC at startup (the USB-Noise-Guard feature). Use the keys above to toggle them on and off during playback and compare the effect for yourself, without interrupting the music.
 
 Toggling the autosuspend mitigation with `k` requires write access to the USB DAC's power-management file. Run the bundled `install_usb_audio_optimize.sh` once with `sudo` (log out and back in afterward), and it will be applied automatically at startup, which also enables toggling with `k`. Playback works fine even without running it, but you may see a "permission denied"-type message in the startup diagnostics or when pressing `k`/`u`.
+
+The `u` / `k` / `j` / `m` keys also work during Qobuz, radio, AirPlay, and DLNA playback. The key guide at the bottom of the screen shows the current state (AS: autosuspend mitigation / RT: real-time priority). This feature requires `usb_noise_guard.py`.
 
 A guide to the available keys is always shown at the bottom of the screen during playback, so you never have to memorize this list.
 
@@ -336,7 +363,27 @@ Recognition runs fully offline with no internet connection required, which also 
 
 Pressing `R` brings up a list of pre-registered internet radio stations (each with a flag icon). Just pick a number to start playback — the same acoustic filter chain used for local playback is applied.
 
-After a station finishes, you stay in the radio menu so you can keep trying others. Press `0` to return to the main menu.
+After a station finishes, you stay in the radio menu so you can keep trying others. On the station list screen, press `0` to return to the main menu.
+
+### Keys During Radio Playback
+
+| Key | Action |
+|---|---|
+| `c` | Change the filter preset |
+| `x` | Select an SI acoustic preset (when Sonia Intelligence is enabled) |
+| `a` | Toggle the Air Particle Layer (奏在) |
+| `s` | Save the current sound-field settings for this station |
+| `l` | Choose and apply the saved settings of another station |
+| `r` | Reset to the default settings |
+| `0` | Toggle DSP bypass (pass-through) ON/OFF |
+| `1`–`6` | Switch the DSP sound field |
+| `q` | Stop and return to the main menu |
+
+Pressing `c` / `x` / `l` / `r` / `a` reconnects the stream so that the setting takes effect. The `s` key and keys `0`–`6` take effect without interrupting the stream.
+
+In earlier versions, resetting the radio settings was done with `0`; since version 1.5.0 it is `r`. `0` is now used for DSP bypass.
+
+The USB-Noise-Guard keys (`u` / `k` / `j` / `m`) are also available. `0` and `1`–`6` work when you started in DSP mode by selecting Loopback.
 
 ---
 
@@ -349,6 +396,8 @@ After a station finishes, you stay in the radio menu so you can keep trying othe
 | `Y` | YouTube Music |
 
 All three **carry over your current acoustic settings as-is** — gain preset, tinnitus relief, the Musikverein room effect, Air Particle Layer, echo mode, output device, and so on. You get the same "Qji sound" for streamed material as you do for local files.
+
+During Qobuz playback, the `0` key (DSP bypass), keys `1`–`6` (switch the DSP sound field), and the `u` / `k` / `j` / `m` keys (USB-Noise-Guard) are also available. `0` and `1`–`6` work when you started in DSP mode by selecting Loopback. During SoundCloud and YouTube Music playback, these keys are not supported in this version.
 
 ---
 
@@ -371,7 +420,11 @@ In either receiving mode, these keys are available during playback:
 | `a` | Toggle the Air Particle Layer |
 | `x` | Select an SI preset |
 | `+` / `-` | Adjust volume |
+| `0` | Toggle DSP bypass (pass-through) ON/OFF |
+| `1`–`6` | Switch the DSP sound field |
 | `q` | Stop |
+
+The USB-Noise-Guard keys (`u` / `k` / `j` / `m`) are also available. `0` and `1`–`6` work when you started in DSP mode by selecting Loopback.
 
 If a required component is missing, the screen will walk you through how to install it.
 
@@ -413,6 +466,10 @@ Creating presets for different listening scenes ("solo late-night listening," "l
 | The output DAC isn't recognized | Try `X` from the main menu (re-detect the DSP output device) |
 | Pressing `k` shows something like "could not turn the autosuspend mitigation OFF (no write permission)" | Run the bundled `install_usb_audio_optimize.sh` once: `sudo bash install_usb_audio_optimize.sh` (no further login is needed; if it still doesn't take effect, try unplugging and reconnecting your DAC) |
 | At startup, the "USB output digital-noise mitigation check" says "not detected as a USB device" | This is expected right after startup, since Loopback (a virtual device) is selected at that point. Once you proceed to select a DSP sound field and then your DAC, the check result for your actual USB DAC will be shown |
+| Switching the sound field (`1`–`6`) shows "Files required for DSP vN were not found" | The sound field's configuration file (`spatial_final.yml`) or its wobble script cannot be found. Nothing is switched and playback continues as before. Place the files that were listed, then try again |
+| `0` shows "The bypass config failed validation" | CamillaDSP's configuration check (`camilladsp -c`) failed. Nothing is changed and playback continues as before |
+| `0` shows "A problem was detected after the reload" | Qji automatically returns to the previous sound field. Check `/tmp/camilladsp.log`. DSP bypass assumes that your CamillaDSP supports reloading its configuration (SIGHUP) |
+| Startup says "USB output noise guard: not installed, so disabled" | `usb_noise_guard.py` was not found. Put it in the same folder as `qji.py`. Only USB-Noise-Guard is unavailable; playback works as usual |
 
 ---
 
@@ -428,6 +485,8 @@ Creating presets for different listening scenes ("solo late-night listening," "l
 | Sonia Intelligence (SI) | An AI-assisted system that adjusts the sound based on natural-language impressions typed in Japanese |
 | Now Playing Mirror | A mirrored display of playback status, viewable from a phone's browser |
 | USB-Noise-Guard | A mechanism that mitigates digital noise specific to USB-connected DACs (clicks from USB autosuspend, jitter from CPU contention). Toggle and check it during playback with the `u`/`k`/`j`/`m` keys |
+| DSP bypass (pass-through) | A state with the CamillaDSP sound-field processing removed. Toggle it during playback with the `0` key. The ffmpeg-side processing is removed with the "Bypass" filter preset |
+| DSP sound field (v1–v6) | The six basic sound fields processed by CamillaDSP. Switch them with keys `1`–`6` during playback or the `D` key on the home screen |
 | USB autosuspend | An OS power-saving feature that lets a USB device drop into a low-power state when idle; on an audio DAC, this can cause clicks from the power cycling |
 
 ---
