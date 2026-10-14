@@ -1317,6 +1317,123 @@ def get_now_playing_control_html():
 </html>"""
 
 
+# ===== ★★★ Simple access control (Now Playing mirror / cover-selection server) ★★★ =====
+import secrets as _secrets
+import hmac as _hmac
+import ipaddress as _ipaddress
+import html as _htmlmod
+import urllib.parse as _urlp
+
+NOW_PLAYING_REQUIRE_TOKEN = True      # False: no passcode (the old behaviour)
+NOW_PLAYING_ALLOW_PUBLIC_IP = False   # True: also accept connections from outside the home network
+_NP_SEC = {'token': _secrets.token_urlsafe(9)}
+_GALLERY_SEC = {'token': None, 'count': 0, 'folders': set()}
+_NP_SSE = {'n': 0, 'max': 16, 'lock': threading.Lock()}
+
+
+def _peer_is_local_network(addr):
+    """True if the peer is loopback / private / link-local / CGNAT(Tailscale etc.)"""
+    try:
+        ip = _ipaddress.ip_address(str(addr).split('%')[0])
+        if getattr(ip, 'ipv4_mapped', None):
+            ip = ip.ipv4_mapped
+        if ip.is_loopback or ip.is_private or ip.is_link_local:
+            return True
+        return ip.version == 4 and ip in _ipaddress.ip_network('100.64.0.0/10')
+    except Exception:
+        return False
+
+
+def _token_ok(given, expected):
+    try:
+        return bool(given) and bool(expected) and _hmac.compare_digest(str(given), str(expected))
+    except Exception:
+        return False
+
+
+def _np_sse_acquire():
+    with _NP_SSE['lock']:
+        if _NP_SSE['n'] >= _NP_SSE['max']:
+            return False
+        _NP_SSE['n'] += 1
+        return True
+
+
+def _np_sse_release():
+    with _NP_SSE['lock']:
+        _NP_SSE['n'] = max(0, _NP_SSE['n'] - 1)
+# put 6 digits such as '123456' to always use the same PIN (default: random at every start)
+NOW_PLAYING_FIXED_PIN = None
+NP_LOGIN_MAX_FAILS_PER_IP = 5      # max failed attempts per device (then it is locked for a while)
+NP_LOGIN_MAX_FAILS_GLOBAL = 30     # max failed attempts across all devices
+NP_LOGIN_WINDOW_SEC = 600          # period (seconds) in which failures are counted; also the lock length
+_NP_LOGIN = {'lock': threading.Lock(), 'ip': {}, 'all': []}
+_NP_LOGIN_PAGES = ('/', '/index.html', '/control', '/control.html')
+
+
+def _np_new_pin():
+    """a 6-digit numeric PIN that is easy to type on a phone (a long random string is hard to type)"""
+    if NOW_PLAYING_FIXED_PIN and str(NOW_PLAYING_FIXED_PIN).isdigit():
+        return str(NOW_PLAYING_FIXED_PIN)
+    return f"{_secrets.randbelow(10 ** 6):06d}"
+
+
+def _np_login_locked(addr):
+    now = time.time()
+    with _NP_LOGIN['lock']:
+        _NP_LOGIN['all'] = [t for t in _NP_LOGIN['all'] if now - t < NP_LOGIN_WINDOW_SEC]
+        if len(_NP_LOGIN['all']) >= NP_LOGIN_MAX_FAILS_GLOBAL:
+            return True
+        fails = [t for t in _NP_LOGIN['ip'].get(addr, []) if now - t < NP_LOGIN_WINDOW_SEC]
+        _NP_LOGIN['ip'][addr] = fails
+        return len(fails) >= NP_LOGIN_MAX_FAILS_PER_IP
+
+
+def _np_login_record(addr, success):
+    with _NP_LOGIN['lock']:
+        if success:
+            _NP_LOGIN['ip'].pop(addr, None)
+        else:
+            now = time.time()
+            _NP_LOGIN['ip'].setdefault(addr, []).append(now)
+            _NP_LOGIN['all'].append(now)
+
+
+def _np_login_html(next_path, message=''):
+    nxt = _htmlmod.escape(next_path if next_path in _NP_LOGIN_PAGES else '/', quote=True)
+    msg = ('<p class="err">' + _htmlmod.escape(message) + '</p>') if message else ''
+    return ('<!DOCTYPE html><html><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width, initial-scale=1">'
+            '<title>QjiDSP Remote</title><style>'
+            'body{background:#111;color:#eee;font-family:sans-serif;text-align:center;padding:12vh 16px}'
+            'input[name=pin]{font-size:2.2em;width:7em;text-align:center;letter-spacing:.25em;padding:.2em;'
+            'border-radius:10px;border:1px solid #666;background:#222;color:#fff}'
+            'button{font-size:1.3em;margin-top:1em;padding:.6em 2.4em;border-radius:10px;border:0;background:#2a6;color:#fff}'
+            '.err{color:#f88}p{color:#bbb}</style></head><body><h2>QjiDSP Remote</h2>'
+            '<p>Enter the 6-digit PIN shown in the Qji terminal.</p>' + msg +
+            '<form method="POST" action="/login">'
+            '<input name="pin" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="off" autofocus>'
+            '<input type="hidden" name="next" value="' + nxt + '"><br>'
+            '<button type="submit">Open</button></form></body></html>')
+
+
+def _np_print_qr(url):
+    """show a QR code a phone can scan if the qrcode library is installed (does nothing otherwise)"""
+    try:
+        import qrcode
+    except ImportError:
+        return
+    try:
+        print('   📷 QR code (scan it with your phone to open the remote directly, no PIN needed):')
+        qr = qrcode.QRCode(border=1)
+        qr.add_data(url)
+        qr.make(fit=True)
+        qr.print_ascii(invert=True)
+    except Exception:
+        pass
+# ===== ★★★ end of simple access control ★★★ =====
+
+
 def start_now_playing_server():
     """Now Playingミラーサーバーをバックグラウンドで起動"""
     global now_playing_server_running, now_playing_server_instance, now_playing_server_thread
@@ -1325,15 +1442,108 @@ def start_now_playing_server():
     import socketserver as _ss
 
     class NowPlayingHandler(SimpleHTTPRequestHandler):
+        timeout = 30  # drop connections that stall while being read, after a while
+
+        def setup(self):
+            super().setup()
+            try:  # detect clients that vanished (phone left the Wi-Fi, tab closed, etc.)
+                import socket as _sk
+                self.connection.setsockopt(_sk.SOL_SOCKET, _sk.SO_KEEPALIVE, 1)
+                for _o, _v in (('TCP_KEEPIDLE', 30), ('TCP_KEEPINTVL', 10), ('TCP_KEEPCNT', 3)):
+                    if hasattr(_sk, _o):
+                        self.connection.setsockopt(_sk.IPPROTO_TCP, getattr(_sk, _o), _v)
+            except Exception:
+                pass
+
+        def end_headers(self):
+            if getattr(self, '_set_np_cookie', False):
+                self.send_header('Set-Cookie', f"qji_np={_NP_SEC['token']}; Path=/; HttpOnly; SameSite=Strict")
+                self._set_np_cookie = False
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            super().end_headers()
+
+        def _guard(self, login_ok=False):
+            # ★ Pre-check: verify the peer, Origin and passcode; if not allowed, answer and return False
+            def _deny(code, msg, ctype='text/plain; charset=utf-8'):
+                body = msg.encode('utf-8')
+                self.send_response(code)
+                self.send_header('Content-Type', ctype)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return False
+            if not NOW_PLAYING_ALLOW_PUBLIC_IP and not _peer_is_local_network(self.client_address[0]):
+                return _deny(403, 'Forbidden')
+            origin = self.headers.get('Origin')
+            if origin and _urlp.urlparse(origin).netloc != (self.headers.get('Host') or ''):
+                return _deny(403, 'Forbidden (origin)')
+            if not NOW_PLAYING_REQUIRE_TOKEN:
+                return True
+            tok = _NP_SEC['token']
+            qs = _urlp.parse_qs(_urlp.urlparse(self.path).query)
+            if _token_ok((qs.get('k') or [''])[0], tok):
+                self._set_np_cookie = True
+                return True
+            for part in (self.headers.get('Cookie') or '').split(';'):
+                k, _, v = part.strip().partition('=')
+                if k == 'qji_np' and _token_ok(v, tok):
+                    return True
+            if login_ok:
+                return True
+            _p = _urlp.urlparse(self.path).path
+            if self.command in ('GET', 'HEAD') and _p in _NP_LOGIN_PAGES:
+                return _deny(401, _np_login_html(_p), 'text/html; charset=utf-8')
+            return _deny(403, 'To open this page, open the top page on your phone (the URL without anything after it) and enter the PIN shown in the Qji terminal.')
+
+        def _handle_login(self):
+            """POST /login: check the PIN (with lockout after repeated failures) and hand out the session cookie."""
+            addr = self.client_address[0]
+            nxt = '/'
+            def _page(code, message=''):
+                body = _np_login_html(nxt, message).encode('utf-8')
+                self.send_response(code)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            try:
+                length = int(self.headers.get('Content-Length', 0))
+            except ValueError:
+                length = -1
+            if length < 0 or length > 512:
+                self.send_response(413)
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+                return
+            form = _urlp.parse_qs(self.rfile.read(length).decode('utf-8', 'replace'))
+            cand = (form.get('next') or ['/'])[0]
+            nxt = cand if cand in _NP_LOGIN_PAGES else '/'
+            if _np_login_locked(addr):
+                return _page(429, 'Too many failed attempts. Please wait a while and try again.')
+            pin = ''.join(ch for ch in (form.get('pin') or [''])[0] if ch.isdigit())
+            if _token_ok(pin, _NP_SEC.get('pin')):
+                _np_login_record(addr, True)
+                self._set_np_cookie = True
+                self.send_response(303)
+                self.send_header('Location', nxt)
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+                return
+            _np_login_record(addr, False)
+            return _page(401, 'Wrong PIN.')
+
         def do_GET(self):
-            if self.path == '/' or self.path == '/index.html':
+            if not self._guard():
+                return
+            _p = _urlp.urlparse(self.path).path
+            if _p == '/' or _p == '/index.html':
                 html = get_now_playing_html().encode('utf-8')
                 self.send_response(200)
                 self.send_header('Content-Type', 'text/html; charset=utf-8')
                 self.send_header('Content-Length', str(len(html)))
                 self.end_headers()
                 self.wfile.write(html)
-            elif self.path == '/control' or self.path == '/control.html':
+            elif _p == '/control' or _p == '/control.html':
                 html = get_now_playing_control_html().encode('utf-8')
                 self.send_response(200)
                 self.send_header('Content-Type', 'text/html; charset=utf-8')
@@ -1367,27 +1577,30 @@ def start_now_playing_server():
                 from urllib.parse import urlparse, parse_qs, unquote as _unq
                 _parsed = urlparse(self.path)
                 _params = parse_qs(_parsed.query)
-                _title     = _unq(_params.get('title',     [''])[0])
-                _composer  = _unq(_params.get('composer',  [''])[0])
-                _performer = _unq(_params.get('performer', [''])[0])
-                _album     = _unq(_params.get('album',     [''])[0])
+                _title     = _unq(_params.get('title', [''])[0])[:200]
+                _composer  = _unq(_params.get('composer', [''])[0])[:200]
+                _performer = _unq(_params.get('performer', [''])[0])[:200]
+                _album     = _unq(_params.get('album', [''])[0])[:200]
                 _result    = _fetch_music_info(_title, _composer, _performer, _album)
                 _body = json.dumps(_result, ensure_ascii=False).encode('utf-8')
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json; charset=utf-8')
                 self.send_header('Content-Length', str(len(_body)))
-                self.send_header('Access-Control-Allow-Origin', '*')
                 self.send_header('Cache-Control', 'no-store')
                 self.end_headers()
                 self.wfile.write(_body)
-            elif self.path == '/events':
+            elif _p == '/events':
+                if not _np_sse_acquire():
+                    self.send_response(503)
+                    self.end_headers()
+                    return
                 self.send_response(200)
                 self.send_header('Content-Type', 'text/event-stream')
                 self.send_header('Cache-Control', 'no-cache')
                 self.send_header('Connection', 'keep-alive')
-                self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
                 last_sent = {}
+                _last_write = time.time()
                 try:
                     while now_playing_server_running:
                         with info_display_lock:
@@ -1413,17 +1626,38 @@ def start_now_playing_server():
                             self.wfile.write(line.encode('utf-8'))
                             self.wfile.flush()
                             last_sent = payload
+                            _last_write = time.time()
+                        elif time.time() - _last_write >= 5.0:
+                            # heartbeat: lets the server notice a closed connection (EventSource ignores lines starting with ':')
+                            self.wfile.write(b': keepalive\n\n')
+                            self.wfile.flush()
+                            _last_write = time.time()
                         time.sleep(1.0)
                 except:
                     pass
+                finally:
+                    _np_sse_release()
             else:
                 self.send_response(404)
                 self.end_headers()
 
         def do_POST(self):
+            if _urlp.urlparse(self.path).path == '/login':
+                if self._guard(login_ok=True):
+                    self._handle_login()
+                return
+            if not self._guard():
+                return
             if self.path == '/cmd':
                 import json as _json
-                length = int(self.headers.get('Content-Length', 0))
+                try:
+                    length = int(self.headers.get('Content-Length', 0))
+                except ValueError:
+                    length = -1
+                if length < 0 or length > 4096:
+                    self.send_response(413)
+                    self.end_headers()
+                    return
                 body = self.rfile.read(length)
                 try:
                     data = _json.loads(body)
@@ -1502,7 +1736,11 @@ def start_now_playing_server():
                 elif action == 'set_volume':
                     _val = data.get('value', 0)
                     try:
-                        _new_db = set_live_gain_db(_val)
+                        import math as _math
+                        _f = float(_val)
+                        if not _math.isfinite(_f):
+                            raise ValueError('non-finite')
+                        _new_db = set_live_gain_db(_f)
                         msg = 'ok'
                     except Exception:
                         msg = 'error'
@@ -1510,7 +1748,6 @@ def start_now_playing_server():
                     self.send_response(200)
                     self.send_header('Content-Type', 'application/json; charset=utf-8')
                     self.send_header('Content-Length', str(len(resp)))
-                    self.send_header('Access-Control-Allow-Origin', '*')
                     self.end_headers()
                     self.wfile.write(resp)
                     return
@@ -1519,7 +1756,6 @@ def start_now_playing_server():
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json; charset=utf-8')
                 self.send_header('Content-Length', str(len(resp)))
-                self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
                 self.wfile.write(resp)
             else:
@@ -1532,6 +1768,7 @@ def start_now_playing_server():
     def run_server():
         global now_playing_server_instance
         _ss.ThreadingTCPServer.allow_reuse_address = True
+        _ss.ThreadingTCPServer.daemon_threads = True
         try:
             with _ss.ThreadingTCPServer(('', NOW_PLAYING_PORT), NowPlayingHandler) as httpd:
                 now_playing_server_instance = httpd
@@ -1545,9 +1782,15 @@ def start_now_playing_server():
     now_playing_server_thread = threading.Thread(target=run_server, daemon=True)
     now_playing_server_thread.start()
     ip = get_local_ip()
+    _NP_SEC['token'] = _secrets.token_urlsafe(9)  # this session's passcode
+    _NP_SEC['pin'] = _np_new_pin()  # 6-digit PIN for phones
+    _np_q = ''  # the URLs stay short and plain: phones sign in with the PIN (or the QR code)
     print(f"\n📱 Now Playing mirror started!")
-    print(f"   🖼  Cover display   → http://{ip}:{NOW_PLAYING_PORT}/")
-    print(f"   🎛  Playback control → http://{ip}:{NOW_PLAYING_PORT}/control")
+    print(f"   🖼  Cover display   → http://{ip}:{NOW_PLAYING_PORT}/{_np_q}")
+    print(f"   🎛  Playback control → http://{ip}:{NOW_PLAYING_PORT}/control{_np_q}")
+    if NOW_PLAYING_REQUIRE_TOKEN:
+        print(f"   🔐 PIN: {_NP_SEC['pin']}   <- open the URL above on your phone and enter this")
+        _np_print_qr(f"http://{ip}:{NOW_PLAYING_PORT}/control?k={_NP_SEC['token']}")
     print(f"   (accessible from any device on the same Wi-Fi)\n")
 
 def stop_now_playing_server():
@@ -4533,6 +4776,7 @@ def play_radio_stream(station):
                 #   区切ってくることがあり、これが「一瞬無音→即再生再開」の主因になる。
                 '-reconnect_at_eof', '1',
                 '-timeout', '15000000',
+                '-protocol_whitelist', 'http,https,tcp,tls,crypto',
                 '-i', url,
                 '-vn',
                 '-ar', output_sample_rate,
@@ -7378,10 +7622,10 @@ def display_album_covers_with_feh(album_covers, keep_browser_open=False, existin
         except:
             pass
     if not os.path.exists(temp_dir):
-        os.makedirs(temp_dir, mode=0o755)
+        os.makedirs(temp_dir, mode=0o700)
     
     try:
-        os.chmod(temp_dir, 0o755)
+        os.chmod(temp_dir, 0o700)
     except:
         pass
     
@@ -7411,6 +7655,10 @@ def display_album_covers_with_feh(album_covers, keep_browser_open=False, existin
             image_files.append((i, new_name, os.path.basename(folder), track_count, folder))
         
         # HTMLギャラリーを生成
+        if _GALLERY_SEC['token'] is None:
+            _GALLERY_SEC['token'] = _secrets.token_urlsafe(12)
+        _GALLERY_SEC['count'] = len(album_covers)
+        _GALLERY_SEC['folders'] = set(os.path.realpath(_f) for (_ip, _f, _tc) in album_covers)
         html_content = """<!DOCTYPE html>
 <html>
 <head>
@@ -7637,10 +7885,10 @@ def display_album_covers_with_feh(album_covers, keep_browser_open=False, existin
         for i, filename, folder_name, track_count, folder_path in image_files:
             cache_buster = f"?v={timestamp}"
             # フォルダーパスをエスケープしてdata属性に追加
-            escaped_folder = folder_path.replace("'", "\\'")
+            escaped_folder = _htmlmod.escape(folder_path, quote=True)
             html_content += f"""
-        <div class="album" id="album-{i}" onclick="selectAlbum({i}, this)" data-folder="{escaped_folder}" data-name="{folder_name[:40]}">
-            <img src="{filename}{cache_buster}" alt="Album {i}">
+        <div class="album" id="album-{i}" onclick="selectAlbum({i}, this)" data-folder="{escaped_folder}" data-name="{_htmlmod.escape(folder_name[:40], quote=True)}">
+            <img src="{_htmlmod.escape(filename, quote=True)}{cache_buster}" alt="Album {i}">
             <div class="album-number">{i}</div>
             <div class="album-info">{track_count} tracks</div>
             <div class="played-mark">✓</div>
@@ -7660,12 +7908,19 @@ def display_album_covers_with_feh(album_covers, keep_browser_open=False, existin
                 el.innerHTML = '<div class="queue-empty">Click to add</div>';
                 return;
             }
-            el.innerHTML = queueList.map((item, idx) =>
-                `<div class="queue-item">
-                    <span class="queue-pos">${idx + 1}</span>
-                    <span>${item.name || ('Album ' + item.num)}</span>
-                </div>`
-            ).join('');
+            el.innerHTML = '';
+            queueList.forEach(function(item, idx) {
+                const row = document.createElement('div');
+                row.className = 'queue-item';
+                const pos = document.createElement('span');
+                pos.className = 'queue-pos';
+                pos.textContent = String(idx + 1);
+                const nm = document.createElement('span');
+                nm.textContent = item.name || ('Album ' + item.num);
+                row.appendChild(pos);
+                row.appendChild(nm);
+                el.appendChild(row);
+            });
         }
         
         function clearQueue() {
@@ -7697,7 +7952,7 @@ def display_album_covers_with_feh(album_covers, keep_browser_open=False, existin
             localStorage.setItem('selected_album', number);
             
             // サーバーに送信
-            fetch('select.php?num=' + number, {method: 'POST'})
+            fetch('select.php?num=' + number + '&t=__QJI_TOKEN__', {method: 'POST'})
                 .catch(function() {});
             
             setTimeout(function() {
@@ -7727,7 +7982,7 @@ def display_album_covers_with_feh(album_covers, keep_browser_open=False, existin
         // フォルダーを開く
         function openFolder() {
             if (currentContextFolder) {
-                fetch('open_folder.php?path=' + encodeURIComponent(currentContextFolder), {method: 'POST'})
+                fetch('open_folder.php?path=' + encodeURIComponent(currentContextFolder) + '&t=__QJI_TOKEN__', {method: 'POST'})
                     .then(response => {
                         document.getElementById('status').textContent = 'Folder opened';
                         document.getElementById('status').classList.add('show');
@@ -7757,12 +8012,13 @@ def display_album_covers_with_feh(album_covers, keep_browser_open=False, existin
 </html>
 """
         
+        html_content = html_content.replace('__QJI_TOKEN__', _GALLERY_SEC['token'])
         html_file = os.path.join(temp_dir, 'gallery.html')
         with open(html_file, 'w', encoding='utf-8') as f:
             f.write(html_content)
         
         try:
-            os.chmod(html_file, 0o644)
+            os.chmod(html_file, 0o600)
         except:
             pass
         
@@ -7772,14 +8028,54 @@ def display_album_covers_with_feh(album_covers, keep_browser_open=False, existin
         # 既存のサーバーがあればそれを使用
         if existing_server is None:
             class SelectionHandler(SimpleHTTPRequestHandler):
+                timeout = 10  # drop connections that stall while being read, after a while
+
+                def _host_ok(self):
+                    host = (self.headers.get('Host') or '').strip().lower()
+                    port = self.server.server_address[1]
+                    return host in (f'127.0.0.1:{port}', f'localhost:{port}', f'[::1]:{port}')
+
+                def _deny(self, code=403):
+                    try:
+                        self.send_response(code)
+                        self.send_header('Content-Length', '0')
+                        self.end_headers()
+                    except Exception:
+                        pass
+
+                def list_directory(self, path):
+                    self.send_error(404, 'Not Found')
+                    return None
+
+                def do_GET(self):
+                    if not self._host_ok():
+                        return self._deny(403)
+                    super().do_GET()
+
+                def do_HEAD(self):
+                    if not self._host_ok():
+                        return self._deny(403)
+                    super().do_HEAD()
+
                 def do_POST(self):
                     global web_selection_result, next_album_selection
+                    if not self._host_ok():
+                        return self._deny(403)
+                    import urllib.parse as _upm
+                    _qq = _upm.parse_qs(_upm.urlparse(self.path).query)
+                    if not _token_ok((_qq.get('t') or [''])[0], _GALLERY_SEC['token']):
+                        return self._deny(403)
                     if 'select.php' in self.path:
                         import urllib.parse
                         query = urllib.parse.urlparse(self.path).query
                         params = urllib.parse.parse_qs(query)
                         if 'num' in params:
-                            num = int(params['num'][0])
+                            try:
+                                num = int(params['num'][0])
+                            except ValueError:
+                                return self._deny(400)
+                            if not (1 <= num <= _GALLERY_SEC['count']) or len(next_album_selection) >= 500:
+                                return self._deny(400)
                             next_album_selection.append(num)
                             web_selection_result = num  # 互換性のため残す
                             q_len = len(next_album_selection)
@@ -7792,6 +8088,8 @@ def display_album_covers_with_feh(album_covers, keep_browser_open=False, existin
                         params = urllib.parse.parse_qs(query)
                         if 'path' in params:
                             folder_path = params['path'][0]
+                            if os.path.realpath(folder_path) not in _GALLERY_SEC['folders']:
+                                return self._deny(403)
                             print(f"\n📁 Opening folder: {folder_path}")
                             try:
                                 # ファイルマネージャーでフォルダーを開く
@@ -7825,7 +8123,7 @@ def display_album_covers_with_feh(album_covers, keep_browser_open=False, existin
                 # ★★★ SO_REUSEADDRオプションを追加 ★★★
                 socketserver.TCPServer.allow_reuse_address = True
                 try:
-                    with socketserver.TCPServer(("", server_port), SelectionHandler) as httpd:
+                    with socketserver.TCPServer(("127.0.0.1", server_port), SelectionHandler) as httpd:
                         web_server_instance = httpd
                         httpd.timeout = 1
                         while web_server_running:
@@ -7849,7 +8147,7 @@ def display_album_covers_with_feh(album_covers, keep_browser_open=False, existin
             print(f"  {i:3d}. {folder_name[:60]:60} ({track_count} tracks)")
         
         print("\n" + "=" * 60)
-        print(f"💡 Open in browser: http://localhost:{server_port}/gallery.html")
+        print(f"💡 Open in browser: http://127.0.0.1:{server_port}/gallery.html")
         print("=" * 60)
         print("🎵 How to use:")
         print("   1. Open the URL above in a browser")
@@ -7858,7 +8156,7 @@ def display_album_covers_with_feh(album_covers, keep_browser_open=False, existin
         print("   4. Enter 'q' or 'back' to exit")
         print("=" * 60)
         
-        browser_url = f"http://localhost:{server_port}/gallery.html"
+        browser_url = f"http://127.0.0.1:{server_port}/gallery.html"
         browser_process = None
         
         profile_dir = os.path.expanduser('~/music_player_chrome_profile')
@@ -10585,7 +10883,7 @@ def play_one_track(track, show_controls=True):
         terminal_print(f"   Mood: {color}{emoji} {mood_en}{reset}")
     
     if show_controls:
-        terminal_print(f"🎹 [r]Restart | [f]Play folder in order | [n]Next | [b]Prev | [i]Show image again | [o]Add to favorites | [ ][ [ ]Volume | [v]Volume ON/OFF | [0]Bypass/[1-6]Sound field (DSP) | [u/k/j/m]USB guard (all/AS/RT/status): {_usb_guard_summary()} | [q]Quit to menu")
+        terminal_print(f"🎹 [r]Restart | [f]Play folder in order | [n]Next | [b]Prev | [i]Show image again | [o]Add to favorites | [ and ] Volume | [v]Volume ON/OFF | [0]Bypass/[1-6]Sound field (DSP) | [u/k/j/m]USB guard (all/AS/RT/status): {_usb_guard_summary()} | [q]Quit to menu")
         _gp_labels = {'classical': 'Classical(0dB)', 'general': 'General(-1.5dB)', 'jazz_pop': 'Pop(-3.5dB)', 'loud': 'Loud(-5dB)'}
         terminal_print(f"🔊 [+][-]Output gain ({CURRENT_VOLUME:+d} dB) | [g]Input gain ({_gp_labels.get(current_gain_preset, current_gain_preset)}) | [c]Filter | [s]Save", end="")
         if SI_AVAILABLE:
@@ -10794,7 +11092,7 @@ def play_one_track(track, show_controls=True):
             'aplay', 
             '-D', output_device, 
             '-f', 'S32_LE', '-c', '2', '-t', 'raw',  # ★ Explicitly raw PCM (no header)
-            '-r', '48000' if dsp_mode_active else str(original_sample_rate),  # ★★★
+            '-r', str(output_sample_rate),
             '--buffer-size=262144', 
             '--period-size=32768'
         ]
@@ -10811,7 +11109,7 @@ def play_one_track(track, show_controls=True):
             'aplay', 
             '-D', output_device, 
             '-f', 'S32_LE', '-c', '2', '-t', 'raw',
-            '-r', '48000' if dsp_mode_active else str(original_sample_rate),
+            '-r', str(output_sample_rate),  # ★ Always match ffmpeg's output rate (raw PCM has no header; keeps upsampling playing at the right speed)
             '--buffer-size=65536',   # ★ Roughly 1.4s at 48kHz
             '--period-size=8192'
         ]
@@ -11753,7 +12051,7 @@ def keyboard_listener():
                     # 画面クリア後にコントロール表示を再描画
                     try:
                         time.sleep(0.1)
-                        terminal_print(f"\n🎹 [r]Restart | [f]Folder | [n]Next | [b]Prev | [i]Show image | [o]Favorite | [ ][ [ ]Volume | [v]Vol ON/OFF | [0]Bypass/[1-6]DSP | [u/k/j/m]USB guard: {_usb_guard_summary()} | [q]Menu")
+                        terminal_print(f"\n🎹 [r]Restart | [f]Folder | [n]Next | [b]Prev | [i]Show image | [o]Favorite | [ and ] Volume | [v]Vol ON/OFF | [0]Bypass/[1-6]DSP | [u/k/j/m]USB guard: {_usb_guard_summary()} | [q]Menu")
                         _gp_l = {'classical': 'Classical(0dB)', 'general': 'General(-1.5dB)', 'jazz_pop': 'Pop(-3.5dB)', 'loud': 'Loud(-5dB)'}
                         terminal_print(f"🔊 [+][-]Output gain ({CURRENT_VOLUME:+d} dB) | [g]Gain ({_gp_l.get(current_gain_preset, current_gain_preset)}) | [c]Filter | [s]Save", end="")
                         if SI_AVAILABLE:
@@ -11764,7 +12062,7 @@ def keyboard_listener():
                         pass
                     # ── 画面クリア後にキーガイドを再表示 ──
                     time.sleep(0.1)
-                    terminal_print(f"\n🎹 [r]Restart | [f]Folder | [n]Next | [b]Prev | [i]Show image | [o]Favorite | [ ][ [ ]Volume | [v]Vol ON/OFF | [0]Bypass/[1-6]DSP | [u/k/j/m]USB guard: {_usb_guard_summary()} | [q]Menu")
+                    terminal_print(f"\n🎹 [r]Restart | [f]Folder | [n]Next | [b]Prev | [i]Show image | [o]Favorite | [ and ] Volume | [v]Vol ON/OFF | [0]Bypass/[1-6]DSP | [u/k/j/m]USB guard: {_usb_guard_summary()} | [q]Menu")
                     _fp = FILTER_PRESET_LABELS.get(current_filter_preset, current_filter_preset)
                     _gp_l2 = {'classical': 'Classical(0dB)', 'general': 'General(-1.5dB)', 'jazz_pop': 'Pop(-3.5dB)', 'loud': 'Loud(-5dB)'}
                     terminal_print(f"🔊 [+][-]Output gain ({CURRENT_VOLUME:+d} dB) | [g]Gain ({_gp_l2.get(current_gain_preset, current_gain_preset)}) | [c]Filter ({_fp}) | [s]Save", end="")
@@ -12110,7 +12408,7 @@ def play_tracks_gapless(tracks, start_index=0):
             'aplay', 
             '-D', output_device, 
             '-f', 'S32_LE', '-c', '2', '-t', 'raw',  # ★ Explicitly raw PCM (no header)
-            '-r', '48000' if dsp_mode_active else str(original_sample_rate),
+            '-r', str(output_sample_rate),  # ★ Always match ffmpeg's output rate (raw PCM has no header; keeps upsampling playing at the right speed)
             '--buffer-size=262144', 
             '--period-size=32768'
         ]
@@ -12120,7 +12418,7 @@ def play_tracks_gapless(tracks, start_index=0):
             'aplay', 
             '-D', output_device, 
             '-f', 'S32_LE', '-c', '2', '-t', 'raw',
-            '-r', '48000' if dsp_mode_active else str(original_sample_rate),
+            '-r', str(output_sample_rate),  # ★ Always match ffmpeg's output rate (raw PCM has no header; keeps upsampling playing at the right speed)
             '--buffer-size=65536',   # ★ Roughly 1.4s at 48kHz
             '--period-size=8192'
         ]

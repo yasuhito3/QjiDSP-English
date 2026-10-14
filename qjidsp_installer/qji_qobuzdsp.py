@@ -350,7 +350,11 @@ def _load_config() -> dict:
 
 def _save_config(config: dict):
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(json.dumps(config, ensure_ascii=False, indent=2))
+    data = json.dumps(config, ensure_ascii=False, indent=2)
+    # create it with mode 600 from the start (no window in which other users could read it)
+    fd = os.open(str(CONFIG_PATH), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w', encoding='utf-8') as _f:
+        _f.write(data)
     CONFIG_PATH.chmod(0o600)
 
 
@@ -1150,6 +1154,7 @@ def _pb_run(sd: dict, url: str, sr: int, fa: list):
          '-reconnect_streamed',         '1',
          '-reconnect_on_network_error', '1',
          '-reconnect_delay_max',        '5',
+         '-protocol_whitelist', 'http,https,tcp,tls,crypto',
          '-i', url,
          '-vn', '-ar', str(48000 if _is_dsp_mode_active() else sr), '-acodec', 'pcm_s32le']
         + fa + ['-f', 'wav', '-']
@@ -1510,6 +1515,7 @@ def _play_one(stream_url: str, sample_rate: int,
          '-reconnect_streamed',         '1',
          '-reconnect_on_network_error', '1',
          '-reconnect_delay_max',        '5',
+         '-protocol_whitelist', 'http,https,tcp,tls,crypto',
          '-i', stream_url,
          '-vn', '-ar', str(48000 if _is_dsp_mode_active() else sample_rate), '-acodec', 'pcm_s32le']
         + filter_args
@@ -1637,6 +1643,7 @@ def _play_one_gapless(stream_url: str, sample_rate: int,
              '-reconnect_streamed',         '1',
              '-reconnect_on_network_error', '1',
              '-reconnect_delay_max',        '5',
+             '-protocol_whitelist', 'http,https,tcp,tls,crypto',
              '-i', stream_url,
              '-vn', '-ar', str(48000 if _is_dsp_mode_active() else sample_rate), '-acodec', 'pcm_s32le']
             + filter_args
@@ -1951,7 +1958,8 @@ def _setup_token(config: dict) -> bool:
        X-App-Id           （数字）
   ─────────────────────────────────────────────────────""")
     username   = input('  Email address (display only): ').strip()
-    auth_token = input('  X-User-Auth-Token       : ').strip()
+    import getpass as _getpass
+    auth_token = _getpass.getpass('  X-User-Auth-Token (input is hidden): ').strip()
     app_id     = input('  X-App-Id                : ').strip()
     if not auth_token or not app_id:
         print('  ❌ Required fields are missing'); return False
