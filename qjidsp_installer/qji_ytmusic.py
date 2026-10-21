@@ -17,7 +17,8 @@ qji.py から Y キーで呼び出される。
 認証（任意）:
   ytmusicapi のブラウザ認証を設定すると「いいね」した曲やライブラリに
   アクセス可能になる。
-    python3 -c "from ytmusicapi import YTMusic; YTMusic.setup(filepath='~/.config/qji_ytmusic_auth.json')"
+    mkdir -p ~/.config
+    python3 -c "import os, ytmusicapi; ytmusicapi.setup(filepath=os.path.expanduser('~/.config/qji_ytmusic_auth.json'))"
 """
 
 import os, re, sys, json, select, time, threading, subprocess, tempfile
@@ -25,6 +26,163 @@ import termios, tty
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, List, Dict
+import stat as _stat
+from urllib.parse import urlparse as _urlparse, urljoin as _urljoin
+
+# ═══════════════════════════════════════════════════════════════════════════
+# セキュリティー補助（外部から来る URL・文字列・ファイルを、信用しないための関数群）
+# ═══════════════════════════════════════════════════════════════════════════
+
+# 再生を許可するのは、YouTube / YouTube Music の URL だけ（サブドメインを含む）
+_ALLOWED_MEDIA_HOSTS = ('youtube.com', 'youtu.be', 'youtube-nocookie.com')
+# ジャケット画像を取りに行ってよいのは、YouTube / Google の画像配信ホストだけ
+_ALLOWED_IMAGE_HOSTS = ('googleusercontent.com', 'ggpht.com', 'ytimg.com', 'youtube.com', 'gstatic.com')
+_MAX_IMAGE_BYTES = 8 * 1024 * 1024
+_ANSI_RE = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]')
+_CTRL_RE = re.compile(r'[\x00-\x1f\x7f-\x9f]')
+
+
+def _host_allowed(host, allowed) -> bool:
+    host = (host or '').lower().rstrip('.')
+    return any(host == h or host.endswith('.' + h) for h in allowed)
+
+
+def _safe_url(url, allowed_hosts, schemes) -> Optional[str]:
+    """許可したホストの URL だけを返す。それ以外（先頭が '-' の文字列、制御文字入り、
+    他のホスト、ユーザー名つき、特殊なポートなど）は None。"""
+    if not isinstance(url, str):
+        return None
+    url = url.strip()
+    if not url or len(url) > 2000 or url.startswith('-') or _CTRL_RE.search(url) or ' ' in url:
+        return None
+    try:
+        u = _urlparse(url)
+        port = u.port
+    except ValueError:
+        return None
+    if u.scheme not in schemes or u.username or u.password or port not in (None, 80, 443):
+        return None
+    if not _host_allowed(u.hostname, allowed_hosts):
+        return None
+    return url
+
+
+def _safe_media_url(url) -> Optional[str]:
+    return _safe_url(url, _ALLOWED_MEDIA_HOSTS, ('http', 'https'))
+
+
+def _safe_image_url(url) -> Optional[str]:
+    return _safe_url(url, _ALLOWED_IMAGE_HOSTS, ('https',))
+
+
+def _clean(value, maxlen: int = 300) -> str:
+    """曲名などの外部文字列から、端末の制御シーケンス（色・カーソル移動・タイトル変更など）を取り除く。"""
+    text = '' if value is None else str(value)
+    text = _ANSI_RE.sub('', text)
+    text = _CTRL_RE.sub(' ', text)
+    return text.strip()[:maxlen]
+
+
+def _as_int(v, default, lo=None, hi=None) -> int:
+    try:
+        if isinstance(v, bool):
+            raise ValueError
+        n = int(v)
+    except (TypeError, ValueError, OverflowError):   # inf / nan / 巨大値も既定値へ
+        n = default
+    if lo is not None:
+        n = max(lo, n)
+    if hi is not None:
+        n = min(hi, n)
+    return n
+
+
+_PRIV_DIR = None
+
+
+def _private_dir() -> Path:
+    """自分だけが読み書きできる作業フォルダー。共有の /tmp に、固定名のファイルを置かないために使う。
+    他人の所有・シンボリックリンクなら使わず、新しい専用フォルダーにする。"""
+    global _PRIV_DIR
+    if _PRIV_DIR is not None:
+        return _PRIV_DIR
+    uid = os.getuid()
+    cands = []
+    xdg = os.environ.get('XDG_RUNTIME_DIR')
+    if xdg:
+        cands.append(Path(xdg) / 'qji')
+    cands.append(Path(tempfile.gettempdir()) / f'qji-{uid}')
+    for p in cands:
+        try:
+            p.mkdir(mode=0o700, exist_ok=True)
+            st = os.lstat(p)
+            if not _stat.S_ISDIR(st.st_mode) or st.st_uid != uid:
+                continue
+            if st.st_mode & 0o077:
+                os.chmod(p, 0o700)
+            _PRIV_DIR = p
+            return p
+        except OSError:
+            continue
+    _PRIV_DIR = Path(tempfile.mkdtemp(prefix='qji-'))
+    return _PRIV_DIR
+
+
+def _write_private(path, data) -> None:
+    """権限600で新規作成してから、置き換える（書き込み中に、他のユーザーに読まれる隙間を作らない）。"""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(data, str):
+        data = data.encode('utf-8')
+    tmp = path.with_name(f'.{path.name}.{os.getpid()}.tmp')
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
+    fd = os.open(str(tmp), flags, 0o600)
+    with os.fdopen(fd, 'wb') as f:
+        f.write(data)
+    os.replace(str(tmp), str(path))
+
+
+def _ensure_private_file(path) -> bool:
+    """認証ファイル（ログイン済みの Cookie を含む）を、安全に読める状態か確認する。
+    シンボリックリンクや他人所有のファイルは拒否し、権限が緩ければ 600 に締める。"""
+    try:
+        st = os.lstat(str(path))
+    except OSError:
+        return False
+    if not _stat.S_ISREG(st.st_mode):
+        print(f'  ⚠ {path} is not a regular file, so it will not be used')
+        return False
+    if st.st_uid != os.getuid():
+        print(f'  ⚠ {path} is owned by another user, so it will not be used')
+        return False
+    if st.st_mode & 0o077:
+        try:
+            os.chmod(str(path), 0o600)
+            print(f'  🔒 Fixed permissions on {path} to 600 (it contains cookies, so only you should be able to read it)')
+        except OSError:
+            print(f'  ⚠ Could not fix permissions on {path}. Please run chmod 600 on it manually')
+            return False
+    return True
+
+
+_install_declined = set()
+
+
+def _confirm_install(pkg: str, cmd: list) -> bool:
+    """実行中の自動インストールの前に、内容を見せて確認する（既定は N）。"""
+    if pkg in _install_declined:
+        return False
+    print(f'  📦 {pkg} was not found. Install it with the following command?')
+    print('     ' + ' '.join(cmd))
+    try:
+        ans = input('     [y/N]: ').strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        ans = ''
+    if ans in ('y', 'yes'):
+        return True
+    _install_declined.add(pkg)
+    return False
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 定数
@@ -34,7 +192,7 @@ CONFIG_PATH  = Path.home() / '.config' / 'qji_ytmusic.json'
 FAVS_PATH    = Path.home() / '.config' / 'qji_ytmusic_favorites.json'
 AUTH_PATH    = Path.home() / '.config' / 'qji_ytmusic_auth.json'
 REQUEST_PATH = Path('/tmp/qji_ytmusic_request.json')
-_JACKET_TMP  = Path(tempfile.gettempdir()) / 'qji_ytmusic_jacket.jpg'
+_JACKET_TMP  = _private_dir() / 'qji_ytmusic_jacket.jpg'
 
 PORT           = 8082
 YT_SAMPLE_RATE = 48000   # YouTube 音声のネイティブレート
@@ -210,8 +368,7 @@ def _load_config() -> dict:
 
 def _save_config(cfg: dict):
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2))
-    CONFIG_PATH.chmod(0o600)
+    _write_private(CONFIG_PATH, json.dumps(cfg, ensure_ascii=False, indent=2))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -231,6 +388,8 @@ def _get_ytmusic():
     try:
         from ytmusicapi import YTMusic
         if AUTH_PATH.exists():
+            if not _ensure_private_file(AUTH_PATH):
+                return None
             return YTMusic(str(AUTH_PATH))
         return YTMusic()
     except Exception:
@@ -241,7 +400,7 @@ def _best_thumbnail(thumbs: list) -> str:
     """サムネイルリストから最大サイズを選択し、可能なら高解像度化する。"""
     if not thumbs:
         return ''
-    best = max(thumbs, key=lambda t: t.get('width', 0) * t.get('height', 0))
+    best = max(thumbs, key=lambda t: (t.get('width') or 0) * (t.get('height') or 0))
     url = best.get('url', '')
     if not url:
         return ''
@@ -271,8 +430,8 @@ def _artists_str(artists) -> str:
     if not artists:
         return ''
     if isinstance(artists, list):
-        return ', '.join(a.get('name', '') for a in artists if a.get('name'))
-    return str(artists)
+        return _clean(', '.join(a.get('name', '') for a in artists if a.get('name')))
+    return _clean(artists)
 
 
 def _ytm_track_to_dict(r: dict) -> Optional[dict]:
@@ -281,14 +440,14 @@ def _ytm_track_to_dict(r: dict) -> Optional[dict]:
     if not vid:
         return None
     artists = _artists_str(r.get('artists', []))
-    album   = (r.get('album') or {}).get('name', '')
+    album   = _clean((r.get('album') or {}).get('name', ''))
     thumbs  = r.get('thumbnails', [])
     cover   = _best_thumbnail(thumbs)
     dur_sec = r.get('duration_seconds') or _parse_duration(r.get('duration', 0))
     return {
         'url':      f'https://music.youtube.com/watch?v={vid}',
         'id':       vid,
-        'title':    r.get('title', ''),
+        'title':    _clean(r.get('title', '')),
         'artist':   artists,
         'album':    album,
         'cover_url': cover,
@@ -382,7 +541,7 @@ def search_albums(query: str, limit: int = 16) -> List[dict]:
             cover   = _best_thumbnail(thumbs)
             albums.append({
                 'browse_id':   bid,
-                'title':       r.get('title', ''),
+                'title':       _clean(r.get('title', '')),
                 'artist':      artists,
                 'year':        str(r.get('year', '')),
                 'cover_url':   cover,
@@ -416,16 +575,16 @@ def get_album_tracks(browse_id: str) -> Optional[dict]:
             tracks.append({
                 'url':       f'https://music.youtube.com/watch?v={vid}',
                 'id':        vid,
-                'title':     t.get('title', ''),
+                'title':     _clean(t.get('title', '')),
                 'artist':    artists,
-                'album':     album.get('title', ''),
+                'album':     _clean(album.get('title', '')),
                 'cover_url': cover,
                 'duration':  dur_sec,
                 'genre':     '',
             })
         thumbs_main = album.get('thumbnails', [])
         return {
-            'title':       album.get('title', ''),
+            'title':       _clean(album.get('title', '')),
             'artist':      _artists_str(album.get('artists', [])),
             'year':        str(album.get('year', '')),
             'cover_url':   _best_thumbnail(thumbs_main),
@@ -442,8 +601,12 @@ def get_playlist_tracks(playlist_url: str) -> List[dict]:
     YouTube Music プレイリスト URL からトラックリストを取得する。
     yt-dlp --flat-playlist を使用。
     """
+    playlist_url = _safe_media_url(playlist_url)
+    if not playlist_url:
+        print('  ⚠ Unsupported URL (YouTube / YouTube Music only)')
+        return []
     cmd = ['yt-dlp', '--flat-playlist', '--dump-json', '--no-warnings',
-           '--quiet', playlist_url]
+           '--quiet', '--', playlist_url]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
         tracks = []
@@ -462,9 +625,9 @@ def get_playlist_tracks(playlist_url: str) -> List[dict]:
                 tracks.append({
                     'url':       f'https://music.youtube.com/watch?v={vid}',
                     'id':        vid,
-                    'title':     item.get('title', ''),
-                    'artist':    item.get('uploader', item.get('channel', '')),
-                    'album':     item.get('album', ''),
+                    'title':     _clean(item.get('title', '')),
+                    'artist':    _clean(item.get('uploader', item.get('channel', ''))),
+                    'album':     _clean(item.get('album', '')),
                     'cover_url': str(thumb),
                     'duration':  int(item.get('duration') or 0),
                     'genre':     '',
@@ -497,8 +660,8 @@ def _search_ytdlp(query: str, limit: int = 20) -> List[dict]:
                 tracks.append({
                     'url':       f'https://music.youtube.com/watch?v={vid}',
                     'id':        vid,
-                    'title':     item.get('title', ''),
-                    'artist':    item.get('uploader', item.get('channel', '')),
+                    'title':     _clean(item.get('title', '')),
+                    'artist':    _clean(item.get('uploader', item.get('channel', ''))),
                     'album':     '',
                     'cover_url': thumb,
                     'duration':  int(item.get('duration') or 0),
@@ -523,9 +686,12 @@ def _resolve_stream_url(track_url: str) -> Optional[str]:
     """
     # YouTube Music URL → yt-dlp が直接対応
     # 通常の YouTube URL でも動作する
+    track_url = _safe_media_url(track_url)
+    if not track_url:
+        return None
     cmd = ['yt-dlp', '-g',
            '-f', 'bestaudio[ext=webm]/bestaudio[acodec=opus]/bestaudio[ext!=m4a]/bestaudio/best',
-           '--no-playlist', '--no-warnings', track_url]
+           '--no-playlist', '--no-warnings', '--', track_url]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
         if r.returncode == 0:
@@ -545,8 +711,11 @@ def _resolve_stream_url(track_url: str) -> Optional[str]:
 
 def _get_track_info_ytdlp(track_url: str) -> Optional[dict]:
     """yt-dlp でトラックのメタデータを取得する。"""
+    track_url = _safe_media_url(track_url)
+    if not track_url:
+        return None
     cmd = ['yt-dlp', '--dump-json', '--no-playlist', '--no-warnings',
-           '--quiet', track_url]
+           '--quiet', '--', track_url]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if r.returncode == 0:
@@ -558,12 +727,12 @@ def _get_track_info_ytdlp(track_url: str) -> Optional[dict]:
                 return {
                     'url':       f'https://music.youtube.com/watch?v={vid}' if vid else track_url,
                     'id':        vid,
-                    'title':     item.get('title', ''),
-                    'artist':    item.get('uploader', item.get('channel', '')),
-                    'album':     item.get('album', ''),
+                    'title':     _clean(item.get('title', '')),
+                    'artist':    _clean(item.get('uploader', item.get('channel', ''))),
+                    'album':     _clean(item.get('album', '')),
                     'cover_url': thumb,
                     'duration':  int(item.get('duration') or 0),
-                    'genre':     item.get('genre', ''),
+                    'genre':     _clean(item.get('genre', '')),
                     'plays':     item.get('view_count', 0),
                 }
     except Exception:
@@ -575,7 +744,12 @@ def _ensure_ytdlp() -> bool:
     """yt-dlp がインストールされているか確認する。"""
     try:
         r = subprocess.run(['yt-dlp', '--version'], capture_output=True, timeout=5)
-        return r.returncode == 0
+        ok = r.returncode == 0
+        if ok and not _shutil.which('deno'):
+            # yt-dlp が既定で使う JS ランタイムは deno のみ（node 等は --js-runtimes の指定が必要）
+            print('  ℹ deno was not found. This can cause YouTube playback problems (403 errors, m4a-only formats).')
+            print('    Recommended: install deno (2.3 or later) and update yt-dlp with: pip install -U "yt-dlp[default]"')
+        return ok
     except FileNotFoundError:
         print('  ⚠ yt-dlp not found. Install with:')
         print('    pip install yt-dlp --break-system-packages')
@@ -586,10 +760,11 @@ def _ensure_requests() -> bool:
     try:
         import requests; return True
     except ImportError:
-        print('📦 Installing requests...')
-        r = subprocess.run([sys.executable, '-m', 'pip', 'install',
-                            '--user', '--quiet', 'requests'],
-                           capture_output=True)
+        cmd = [sys.executable, '-m', 'pip', 'install', '--user', '--quiet', 'requests']
+        if not _confirm_install('requests', cmd):
+            print('    To install it manually: pip install requests')
+            return False
+        r = subprocess.run(cmd, capture_output=True)
         return r.returncode == 0
 
 
@@ -597,11 +772,12 @@ def _try_install_ytmusicapi():
     """ytmusicapi をインストール試行（失敗してもエラー扱いにしない）。"""
     if _ytmusicapi_available():
         return True
+    cmd = [sys.executable, '-m', 'pip', 'install', 'ytmusicapi', '--break-system-packages', '--quiet']
+    if not _confirm_install('ytmusicapi', cmd):
+        print('  ℹ Continuing without ytmusicapi (yt-dlp search still works)')
+        return False
     print('  📦 Installing ytmusicapi...')
-    r = subprocess.run(
-        [sys.executable, '-m', 'pip', 'install', 'ytmusicapi',
-         '--break-system-packages', '--quiet'],
-        capture_output=True)
+    r = subprocess.run(cmd, capture_output=True)
     if r.returncode == 0:
         print('  ✅ ytmusicapi installed successfully')
         return True
@@ -619,15 +795,38 @@ _feh_hidden = False
 
 
 def _download_jacket(cover_url: str) -> Optional[str]:
-    if not cover_url:
+    """ジャケット画像を取得する。YouTube / Google の画像ホストだけに限り、リダイレクトは1回ずつ検証し、
+    サイズ上限（8MB）と画像の種類を確認して、自分専用のフォルダーに保存する。"""
+    url = _safe_image_url(cover_url)
+    if not url:
         return None
     try:
         import requests
         headers = {'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'}
-        r = requests.get(cover_url, timeout=10, headers=headers)
-        if r.status_code == 200:
-            _JACKET_TMP.write_bytes(r.content)
-            return str(_JACKET_TMP)
+        for _hop in range(4):
+            r = requests.get(url, timeout=10, headers=headers, stream=True, allow_redirects=False)
+            if r.status_code in (301, 302, 303, 307, 308):
+                nxt = _safe_image_url(_urljoin(url, r.headers.get('Location', '')))
+                r.close()
+                if not nxt:
+                    return None
+                url = nxt
+                continue
+            break
+        else:
+            return None
+        try:
+            if r.status_code != 200 or not str(r.headers.get('Content-Type', '')).lower().startswith('image/'):
+                return None
+            buf = bytearray()
+            for chunk in r.iter_content(65536):
+                buf += chunk
+                if len(buf) > _MAX_IMAGE_BYTES:
+                    return None
+        finally:
+            r.close()
+        _write_private(_JACKET_TMP, bytes(buf))
+        return str(_JACKET_TMP)
     except Exception:
         pass
     return None
@@ -675,6 +874,39 @@ def _feh_show(track_info: dict = None, jacket_path: str = None):
         sys.stdout.flush()
 
 
+# qji 本体側がゲイン名を保持している共有変数の候補。
+# 「現在値が既知のゲイン名(GAIN_PRESETS_DB のキー)の文字列」である変数だけを更新するので、
+# 無関係な変数を壊すことはない。終了時に元の値へ戻す。
+_GAIN_GLOBAL_CANDIDATES = ('current_gain_preset', 'gain_preset', 'current_gain_mode',
+                           'gain_mode', 'selected_gain_preset')
+_gain_globals_orig: dict = {}
+
+
+def _sync_qji_gain(state: dict) -> None:
+    gp = state.get('gain_preset')
+    if gp not in GAIN_PRESETS_DB:
+        return
+    try:
+        import __main__ as _qji
+        for name in _GAIN_GLOBAL_CANDIDATES:
+            cur = getattr(_qji, name, None)
+            if isinstance(cur, str) and cur in GAIN_PRESETS_DB:
+                _gain_globals_orig.setdefault(name, cur)
+                setattr(_qji, name, gp)
+    except Exception:
+        pass
+
+
+def _restore_qji_gain() -> None:
+    try:
+        import __main__ as _qji
+        for name, v in _gain_globals_orig.items():
+            setattr(_qji, name, v)
+    except Exception:
+        pass
+    _gain_globals_orig.clear()
+
+
 def _update_now_playing(track: dict, state: dict, elapsed: int = 0):
     global _feh_proc
     try:
@@ -683,6 +915,11 @@ def _update_now_playing(track: dict, state: dict, elapsed: int = 0):
         ctx  = lock if lock else __import__('contextlib').nullcontext()
 
         preset  = FILTER_PRESET_LABELS.get(state.get('filter_preset', 'musikverein'), '')
+        # ジャケット表示（qji 本体側）が current_filter_preset を参照する場合に備え、
+        # 自動検出・手動変更後のプリセットを反映する（終了時に run() が元へ戻す）
+        if hasattr(_qji, 'current_filter_preset') and state.get('filter_preset') in FILTER_PRESETS:
+            _qji.current_filter_preset = state['filter_preset']
+        _sync_qji_gain(state)
         gain_db = GAIN_PRESETS_DB.get(state.get('gain_preset', 'classical'), 0.0)
         vol     = state.get('volume', 12)
         apl     = '🌿 ON' if state.get('air_layer', True) else 'OFF'
@@ -768,7 +1005,7 @@ def _load_favorites() -> List[dict]:
 
 def _save_favorites(favs: List[dict]):
     FAVS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    FAVS_PATH.write_text(json.dumps(favs, ensure_ascii=False, indent=2))
+    _write_private(FAVS_PATH, json.dumps(favs, ensure_ascii=False, indent=2))
 
 
 def _save_to_favorites(state: dict):
@@ -909,10 +1146,11 @@ def _play_one(track: dict, build_filter_func, state: dict,
     """
     1トラックを再生する。
     戻り値: 'next' | 'prev' | 'quit' | 'restart'
+    （内部の _key_loop は、再生が即座に失敗した場合 'failed' を返し、ここで処理する）
     """
-    url = track.get('url', '')
+    url = _safe_media_url(track.get('url', ''))
     if not url:
-        print('  ⚠ URL is empty — skipping.')
+        print('  ⚠ URL is empty or not supported — skipping.')
         return 'next'
 
     # フィルターチェーン構築
@@ -971,16 +1209,16 @@ def _play_one(track: dict, build_filter_func, state: dict,
     # その場合 --hls-use-mpegts で mpegts コンテナに変換してパイプ転送する。
     # ──────────────────────────────────────────────────────────────────
     FMT_PIPE    = 'bestaudio[ext=webm]/bestaudio[acodec=opus]/bestaudio[acodec=vorbis]'
-    FMT_TMPFILE = 'bestaudio'
+    FMT_TMPFILE = 'bestaudio/best'
 
-    _tmpfile = Path(tempfile.gettempdir()) / 'qji_yt_tmp_audio'
+    _tmpfile = _private_dir() / 'qji_yt_tmp_audio'   # 共有の /tmp ではなく、自分専用のフォルダーに置く
 
     # ── 事前フォーマット確認（高速、~2秒）────────────────────────────────
     def _can_pipe() -> bool:
         """webm/opus がある → True（パイプ再生可能）"""
         try:
             r = subprocess.run(
-                ['yt-dlp', '-j', '--no-playlist', '--no-warnings', '--quiet', url],
+                ['yt-dlp', '-j', '--no-playlist', '--no-warnings', '--quiet', '--', url],
                 capture_output=True, text=True, timeout=15)
             if r.returncode != 0:
                 return False
@@ -988,11 +1226,17 @@ def _play_one(track: dict, build_filter_func, state: dict,
             for fmt in info.get('formats', []):
                 ext   = fmt.get('ext', '')
                 acodec = fmt.get('acodec', '')
-                if ext == 'webm' or 'opus' in acodec or 'vorbis' in acodec:
+                vcodec = fmt.get('vcodec')
+                # FMT_PIPE（音声専用のみ）と同じ基準にする: 音声専用で webm/opus/vorbis
+                if (acodec and acodec != 'none'
+                        and vcodec in (None, '', 'none')
+                        and (ext == 'webm'
+                             or 'opus' in acodec
+                             or 'vorbis' in acodec)):
                     return True
             return False
         except Exception:
-            return False   # 判定失敗はパイプを試みる
+            return False   # 判定失敗は tmpfile（ダウンロード方式）へ
 
     use_pipe = _can_pipe()
 
@@ -1004,10 +1248,11 @@ def _play_one(track: dict, build_filter_func, state: dict,
             except Exception: pass
 
         cmd_dl = [
-            'yt-dlp', '-o', str(_tmpfile) + '.%(ext)s',
+            'yt-dlp',
+            '-o', str(_tmpfile) + '.%(ext)s',
             '-q', '--no-playlist', '--no-warnings',
             '-f', FMT_TMPFILE,
-            url,
+            '--', url,
         ]
         try:
             r = subprocess.run(cmd_dl, timeout=180)
@@ -1062,9 +1307,13 @@ def _play_one(track: dict, build_filter_func, state: dict,
             except Exception: pass
         threading.Thread(target=_cleanup, daemon=True).start()
 
-        return _key_loop(p_f2, p_a2, p_yt2, track, state,
+        res2 = _key_loop(p_f2, p_a2, p_yt2, track, state,
                          play_start=time.time(), start_at=start_at,
                          build_filter_func=build_filter_func)
+        if res2 == 'failed':
+            print('  ⚠ Playback ended immediately — skipping.')
+            return 'next'
+        return res2
 
     # ── tmpfile モードへ直行 ─────────────────────────────────────────────
     if not use_pipe:
@@ -1077,7 +1326,7 @@ def _play_one(track: dict, build_filter_func, state: dict,
         'yt-dlp', '-o', '-',
         '-q', '--no-part', '--no-playlist', '--no-warnings',
         '-f', FMT_PIPE,
-        url,
+        '--', url,
     ]
     cmd_ff = (
         ['ffmpeg', '-loglevel', 'warning',
@@ -1118,9 +1367,13 @@ def _play_one(track: dict, build_filter_func, state: dict,
         print(f'  ⚠ Playback launch error: {e}')
         return 'next'
 
-    return _key_loop(p_ff, p_ap, p_ytdlp, track, state,
-                     play_start=time.time(), start_at=start_at,
-                     build_filter_func=build_filter_func)
+    res = _key_loop(p_ff, p_ap, p_ytdlp, track, state,
+                    play_start=time.time(), start_at=start_at,
+                    build_filter_func=build_filter_func)
+    if res == 'failed':
+        print('  ⚠ Pipe playback failed. Switching to download mode.')
+        return _play_via_tmpfile()
+    return res
 
 
 def _dur_str(sec: int) -> str:
@@ -1163,8 +1416,9 @@ def _key_loop(p_ff, p_ap, p_ytdlp, track: dict, state: dict,
     timer_th.start()
 
     result = 'next'
+    _ended_naturally = False
     try:
-        tty_fd = open('/dev/tty', 'rb')
+        tty_fd = open('/dev/tty', 'rb', buffering=0)   # バッファなし（select と整合させる）
         old_settings = termios.tcgetattr(tty_fd)
         tty.setraw(tty_fd.fileno())
         try:
@@ -1246,6 +1500,8 @@ def _key_loop(p_ff, p_ap, p_ytdlp, track: dict, state: dict,
                             state['manual_preset_locked'] = True
                             print(f'  ✅ {FILTER_PRESET_LABELS[FILTER_PRESETS[idx]]} selected')
                     result = 'restart'; break
+            else:
+                _ended_naturally = True   # break せず、プロセスが自分で終了した
         finally:
             try:
                 termios.tcsetattr(tty_fd, termios.TCSANOW, old_settings)
@@ -1254,6 +1510,17 @@ def _key_loop(p_ff, p_ap, p_ytdlp, track: dict, state: dict,
                 pass
     except Exception as e:
         print(f'\n  ⚠ Key input error: {e}')
+
+    # 即座に終わった（＝再生失敗）かを判定する。ユーザー操作での停止は対象外。
+    _yt_failed = False
+    if _ended_naturally:
+        try:
+            _rc = p_ytdlp.wait(timeout=1)
+            _yt_failed = _rc is not None and _rc > 0
+        except Exception:
+            pass
+    _elapsed_run = time.time() - play_start
+    _early_exit = _ended_naturally and (_elapsed_run < 3.0 or (_yt_failed and _elapsed_run < 20.0))
 
     _stop_timer.set()
 
@@ -1273,7 +1540,7 @@ def _key_loop(p_ff, p_ap, p_ytdlp, track: dict, state: dict,
 
     sys.stdout.write('\r                                              \r')
     sys.stdout.flush()
-    return result
+    return 'failed' if _early_exit else result
 
 
 def _play_list(tracks: List[dict], start_idx: int,
@@ -1303,7 +1570,8 @@ def _url_flow(build_filter_func, state: dict):
     url = _yt_readline('\n  🔗 YouTube Music URL を入力: ')
     if not url:
         return
-    if 'youtube' not in url and 'youtu.be' not in url:
+    url = _safe_media_url(url)
+    if not url:
         print('  ⚠ Please enter a YouTube / YouTube Music URL')
         return
 
@@ -1412,7 +1680,7 @@ def _favorites_flow(build_filter_func, state: dict):
             print('  ⚠ Album favourite not found'); return
         tracks = [
             {'url': t['url'], 'title': t['title'], 'artist': t['artist'],
-             'album': t.get('album', af['title']),
+             'album': _clean(t.get('album', af['title'])),
              'cover_url': t.get('cover_url', t.get('art', af.get('cover_url', ''))),
              'duration': t.get('duration', 0), 'genre': ''}
             for t in af.get('tracks', [])
@@ -1431,12 +1699,12 @@ def _favorites_flow(build_filter_func, state: dict):
 
     track = {
         'url':       fav.get('url', ''),
-        'title':     fav.get('title', ''),
-        'artist':    fav.get('artist', ''),
-        'album':     fav.get('album', ''),
+        'title':     _clean(fav.get('title', '')),
+        'artist':    _clean(fav.get('artist', '')),
+        'album':     _clean(fav.get('album', '')),
         'cover_url': fav.get('cover_url', ''),
         'duration':  fav.get('duration', 0),
-        'genre':     fav.get('genre', ''),
+        'genre':     _clean(fav.get('genre', '')),
     }
     audio = fav.get('audio_settings', {})
     if audio:
@@ -1456,40 +1724,61 @@ def _favorites_flow(build_filter_func, state: dict):
             break
 
 
+def _sanitize_track(t) -> Optional[dict]:
+    """外部（ブラウザ UI など）から来た曲情報を検証する。URL が許可外なら None。文字列は制御文字を除く。"""
+    if not isinstance(t, dict):
+        return None
+    url = _safe_media_url(t.get('url', ''))
+    if not url:
+        return None
+    d = dict(t)
+    d.update({
+        'url': url,
+        'title': _clean(t.get('title', '')), 'artist': _clean(t.get('artist', '')),
+        'album': _clean(t.get('album', '')), 'genre': _clean(t.get('genre', '')),
+        'cover_url': str(t.get('cover_url') or '')[:500],
+        'duration': _as_int(t.get('duration', 0), 0, 0, 24 * 3600),
+    })
+    return d
+
+
+def _apply_audio_settings(state: dict, audio) -> None:
+    """ブラウザ UI からの音響設定を、許可した項目・範囲だけ受け付ける。"""
+    if not isinstance(audio, dict):
+        return
+    if audio.get('gain_preset') in GAIN_PRESETS_DB:
+        state['gain_preset'] = audio['gain_preset']
+    if audio.get('filter_preset') in FILTER_PRESETS:
+        state['filter_preset'] = audio['filter_preset']
+    if isinstance(audio.get('air_layer'), bool):
+        state['air_layer'] = audio['air_layer']
+    if 'volume' in audio and not isinstance(audio['volume'], bool) and isinstance(audio['volume'], (int, float)):
+        state['volume'] = _as_int(audio['volume'], state['volume'], -20, 30)
+
+
 def _handle_browser_request(build_filter_func, state: dict, req: dict):
     """ブラウザUIからのリクエストを処理する。"""
     _restore_terminal()
+    if not isinstance(req, dict):
+        print('  ⚠ Invalid request')
+        return
     req_type = req.get('type', 'track')
 
     if req_type == 'playlist':
-        tracks = req.get('tracks', [])
+        raw = req.get('tracks', [])
+        tracks = [x for x in (_sanitize_track(t) for t in (raw if isinstance(raw, list) else [])[:500]) if x]
         if not tracks:
             print('  ⚠ Playlist is empty')
             return
-        start = max(0, req.get('start_from', 1) - 1)
+        start = _as_int(req.get('start_from', 1), 1, 1, len(tracks)) - 1
         print(f'\n  📋 Playlist playback: {len(tracks)} tracks, starting from #{start + 1}')
         _play_list(tracks, start, build_filter_func, state)
     else:
-        track = {
-            'url':       req.get('url', ''),
-            'title':     req.get('title', ''),
-            'artist':    req.get('artist', ''),
-            'album':     req.get('album', ''),
-            'cover_url': req.get('cover_url', ''),
-            'duration':  req.get('duration', 0),
-            'genre':     req.get('genre', ''),
-        }
-        if not track['url']:
-            print('  ⚠ No URL available')
+        track = _sanitize_track(req)
+        if not track:
+            print('  ⚠ No URL available (or the URL is not supported)')
             return
-        audio = req.get('audio_settings', {})
-        if audio:
-            state.update({
-                'gain_preset':   audio.get('gain_preset',   state['gain_preset']),
-                'filter_preset': audio.get('filter_preset', state['filter_preset']),
-                'air_layer':     audio.get('air_layer',     state['air_layer']),
-                'volume':        audio.get('volume',        state['volume']),
-            })
+        _apply_audio_settings(state, req.get('audio_settings', {}))
         _apply_auto_preset(track, state)
         print(f'\n  📱 Browser playback: {track["artist"]} — {track["title"]}')
         while True:
@@ -1519,6 +1808,7 @@ def run(build_filter_func, gain_preset: str, tinnitus: bool,
     _try_install_ytmusicapi()
 
     import __main__ as _qji
+    _orig_fp = getattr(_qji, 'current_filter_preset', None)   # 終了時に元へ戻す
     state = {
         'gain_preset':         gain_preset,
         'filter_preset':       getattr(_qji, 'current_filter_preset', 'musikverein'),
@@ -1548,6 +1838,8 @@ def run(build_filter_func, gain_preset: str, tinnitus: bool,
         _open_incognito_browser(f'http://localhost:{PORT}')
     except ImportError:
         pass
+    except Exception as e:
+        print(f'  ⚠ Could not start the browser UI: {e}')
 
     def _show_menu():
         print('\n' + '═' * 56)
@@ -1646,11 +1938,7 @@ def run(build_filter_func, gain_preset: str, tinnitus: bool,
                 if _browser_available:
                     try: _browser.send_close_signal()
                     except Exception: pass
-                _close_incognito_browser()
-                if _browser_available:
-                    try: _browser.stop_browser_server()
-                    except Exception: pass
-                break
+                break   # ブラウザ・サーバーの後始末は finally で行う
 
             elif ch == 'u':
                 _url_flow(build_filter_func, state)
@@ -1680,6 +1968,16 @@ def run(build_filter_func, gain_preset: str, tinnitus: bool,
                     print('  ⚠ Please enter u / k / f / v / q')
 
     finally:
+        # Ctrl-C・例外で抜けた場合も、シークレットウィンドウ・一時フォルダー・サーバーを残さない
+        try: _close_incognito_browser()
+        except Exception: pass
+        if _browser_available:
+            try: _browser.stop_browser_server()
+            except Exception: pass
+        if _orig_fp is not None:
+            try: _qji.current_filter_preset = _orig_fp
+            except Exception: pass
+        _restore_qji_gain()
         _clear_now_playing()
         _restore_terminal()
         try:

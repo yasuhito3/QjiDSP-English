@@ -74,9 +74,9 @@ Or double-click `QjiDSP Installer.desktop` in your desktop environment.
 The installer will:
 
 - Install required packages (ffmpeg, alsa-utils, git, etc.)
-- Install/update Python libraries (soundfile, scipy, pycamilladsp) and `yt-dlp`
+- Install/update Python libraries (soundfile, scipy, pycamilladsp) and `yt-dlp[default]` (this includes `yt-dlp-ejs`, which YouTube playback needs; if an older `yt-dlp` is taking priority on your PATH, the installer detects it and updates it system-wide with `sudo`)
 - Download CamillaDSP
-- Install `deno` (used to stabilize YouTube Music playback)
+- Install `deno` (used to solve YouTube's signature challenges; **version 2.3 or later is required**)
 - Enable the virtual sound card (`snd-aloop`)
 - Place the full app + DSP config files (soundfields v1-v6) + IR (reverb) file into `~/qji/`
 
@@ -116,10 +116,19 @@ This is the same approach used by Qji Peak Monitor's update checker.
 Set up browser authentication only if you want access to your liked songs and library.
 
 ```bash
-python3 -c "from ytmusicapi import YTMusic; YTMusic.setup(filepath='~/.config/qji_ytmusic_auth.json')"
+mkdir -p ~/.config
+python3 -c "import os, ytmusicapi; ytmusicapi.setup(filepath=os.path.expanduser('~/.config/qji_ytmusic_auth.json'))"
 ```
 
+You will be asked to paste the request headers copied from your browser (Chrome / Firefox) while logged in to music.youtube.com. Paste them, then press `Ctrl-D` to confirm.
+
 Playback itself works via `yt-dlp` search even without this.
+
+> 🔒 **About security**
+> - The auth file contains your logged-in cookies, so when loading it Qji checks its owner and permissions, and automatically tightens them to `600` (readable only by you) if needed.
+> - The YouTube Music browser UI (port 8082) accepts connections **only from this PC itself (127.0.0.1)**. It cannot be opened from a smartphone or other device on your network.
+> - Only YouTube / YouTube Music URLs can be played. Cover art is likewise fetched only from YouTube / Google image hosts.
+> - If a package such as `ytmusicapi` is missing, Qji shows the command it would run and asks for confirmation before installing it (the default is "no").
 
 ### Voice control (Vosk)
 
@@ -134,8 +143,12 @@ Get a model from [alphacep/vosk-api](https://alphacephei.com/vosk/models) or sim
 
 ### Qji Peak Monitor (stereo VU meter)
 
-⚠️ **Not included in this installer (`install_qjidsp.sh`).** Planned as a separate optional repository on GitHub.
-If you need it, please use that repository separately (link to be added once published).
+⚠️ **Not included in this installer (`install_qjidsp.sh`).** It is published as a separate, optional repository:
+👉 **[Qji Peak Monitor](https://github.com/yasuhito3/Qji-peak-monitor)**
+
+A standalone stereo peak (VU) meter that visualizes Qji's final output stage in real time.
+It also has a "display delay" feature that compensates for the downstream buffer offset you get when listening through QjiDSP.
+See that repository's README for installation and usage.
 
 ---
 
@@ -166,6 +179,39 @@ To test just the Loopback → DAC path on its own:
 ```bash
 speaker-test -D hw:CARD=Loopback,DEV=0 -c 2 -r 48000 -F S32_LE
 ```
+
+**If YouTube Music won't play** (a `403` error, tracks ending immediately, etc.)
+
+Because of changes on YouTube's side, playback stops working if `yt-dlp` is out of date. First, update `yt-dlp`:
+
+```bash
+pip install -U "yt-dlp[default]" --break-system-packages
+```
+
+The `[default]` part is important (it also installs `yt-dlp-ejs`, which is needed to solve YouTube's signature challenges).
+
+If it still doesn't work after updating, **an older `yt-dlp` may be taking priority** (for example, a copy installed earlier with `sudo` or via `apt`). Check with:
+
+```bash
+which -a yt-dlp      # lists every yt-dlp found (the first one is used)
+yt-dlp --version     # the version actually being used
+```
+
+If the first one listed is old, update it system-wide:
+
+```bash
+sudo pip3 install --upgrade "yt-dlp[default]" --break-system-packages
+```
+
+If an old copy installed via `apt` is still there, remove it with `sudo apt remove yt-dlp` and then run the command above.
+
+Also make sure `deno` is **version 2.3 or later**:
+
+```bash
+deno --version       # if it's older: deno upgrade
+```
+
+Re-running the installer (`install_qjidsp.sh`) performs these updates and checks automatically.
 
 ---
 

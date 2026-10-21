@@ -74,7 +74,7 @@ echo ""
 echo -e "${BOLD}Install destination: ${QJI_DIR}${RESET}"
 echo "This script will:"
 echo "  1. Install required system packages"
-echo "  2. Install/update Python libraries and yt-dlp"
+echo "  2. Install/update Python libraries and yt-dlp[default] (required for YouTube Music playback)"
 echo "  3. Install CamillaDSP"
 echo "  4. Install deno (used to stabilize YouTube Music playback)"
 echo "  5. Set up the virtual sound card (snd-aloop)"
@@ -122,8 +122,44 @@ pip install $PIP_FLAGS soundfile scipy
 pip install $PIP_FLAGS "git+https://github.com/HEnquist/pycamilladsp.git"
 ok "soundfile / scipy / pycamilladsp installed"
 
-pip install -U $PIP_FLAGS yt-dlp
-ok "yt-dlp updated to the latest version: $(yt-dlp --version 2>/dev/null || echo '(will be verified later)')"
+# Note: install yt-dlp as "yt-dlp[default]". The [default] extra also installs
+# yt-dlp-ejs, which is needed to solve YouTube's signature challenges. Without
+# it, after YouTube's recent changes you get "403" errors or only m4a formats
+# and playback fails. (The JavaScript runtime, deno, is installed in Step 4.)
+YTDLP_SPEC="yt-dlp[default]"
+
+# First attempt: user-level update (no sudo)
+if ! pip install -U $PIP_FLAGS "$YTDLP_SPEC"; then
+    warn "User-level yt-dlp update failed. Retrying with sudo."
+    sudo pip3 install --upgrade $PIP_FLAGS "$YTDLP_SPEC"
+fi
+
+# Note: on some machines an older yt-dlp that was installed earlier with sudo
+# (or via apt) is still sitting in /usr/local/bin or /usr/bin and takes
+# priority over the user-level update above (~/.local/bin). Qji calls whichever
+# yt-dlp comes first on PATH, so check that the version installed via pip and
+# the version actually being called are the same.
+PIP_YTDLP_VER="$(python3 -c 'import yt_dlp.version as v; print(v.__version__)' 2>/dev/null || true)"
+PATH_YTDLP_VER="$(yt-dlp --version 2>/dev/null || true)"
+
+if [ -n "$PIP_YTDLP_VER" ] && [ "$PIP_YTDLP_VER" != "$PATH_YTDLP_VER" ]; then
+    warn "The yt-dlp on your PATH (${PATH_YTDLP_VER:-not found}) differs from the version installed via pip (${PIP_YTDLP_VER})."
+    warn "An older copy may be taking priority, so updating system-wide with sudo."
+    sudo pip3 install --upgrade $PIP_FLAGS "$YTDLP_SPEC"
+    hash -r
+    PIP_YTDLP_VER="$(python3 -c 'import yt_dlp.version as v; print(v.__version__)' 2>/dev/null || true)"
+    PATH_YTDLP_VER="$(yt-dlp --version 2>/dev/null || true)"
+    if [ -n "$PIP_YTDLP_VER" ] && [ "$PIP_YTDLP_VER" != "$PATH_YTDLP_VER" ]; then
+        warn "The versions still differ. Check which yt-dlp is being called with:"
+        warn "  which -a yt-dlp"
+        warn "  (an old apt-installed copy can be removed with 'sudo apt remove yt-dlp')"
+    fi
+fi
+
+if python3 -c 'import yt_dlp' >/dev/null 2>&1 && ! python3 -c 'import yt_dlp_ejs' >/dev/null 2>&1; then
+    warn "yt-dlp-ejs was not found. Please run: pip install -U \"yt-dlp[default]\" $PIP_FLAGS"
+fi
+ok "yt-dlp updated to the latest version: ${PATH_YTDLP_VER:-(will be verified later)}"
 
 # -------------------------------------------------------------
 # Step 3: Install CamillaDSP
@@ -186,6 +222,19 @@ export PATH="$DENO_INSTALL/bin:$PATH"
 
 if command -v deno >/dev/null 2>&1; then
     ok "deno check OK: $(deno --version | head -n1)"
+    # Note: yt-dlp's YouTube signature solver (yt-dlp-ejs) needs deno 2.3 or later.
+    # If an older deno was already installed, the "already installed" branch above
+    # skips it, so warn here.
+    DENO_VER="$(deno --version | head -n1 | awk '{print $2}')"
+    DENO_MAJOR="${DENO_VER%%.*}"
+    DENO_REST="${DENO_VER#*.}"
+    DENO_MINOR="${DENO_REST%%.*}"
+    if [[ "$DENO_MAJOR" =~ ^[0-9]+$ && "$DENO_MINOR" =~ ^[0-9]+$ ]]; then
+        if [ "$DENO_MAJOR" -lt 2 ] || { [ "$DENO_MAJOR" -eq 2 ] && [ "$DENO_MINOR" -lt 3 ]; }; then
+            warn "deno ${DENO_VER} is too old; YouTube playback needs 2.3 or later."
+            warn "  Please update it with: deno upgrade"
+        fi
+    fi
 else
     warn "deno command not found. Please try again after restarting your terminal."
 fi

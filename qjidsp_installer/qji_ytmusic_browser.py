@@ -9,17 +9,56 @@ qji_ytmusic_browser.py  —  YouTube Music ブラウザUI  (ポート 8082)
   ・ブラウザ上でトラック選択 → ターミナルで即再生
 """
 
-import json, time, threading, subprocess, sys, re
+import json, time, threading, subprocess, sys, re, os, stat, tempfile
 from pathlib import Path
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs, quote, unquote
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs, quote, urljoin
 from typing import Optional, List
 
 PORT         = 8082
 FAVS_PATH      = Path.home() / '.config' / 'qji_ytmusic_favorites.json'
 ALBUM_FAVS_PATH = Path.home() / '.config' / 'qji_ytmusic_album_favs.json'
 AUTH_PATH    = Path.home() / '.config' / 'qji_ytmusic_auth.json'
-REQUEST_PATH = Path('/tmp/qji_ytmusic_request.json')
+
+
+def _private_dir() -> Path:
+    """自分専用(0700)のディレクトリ。XDG_RUNTIME_DIR/qji を優先する。"""
+    uid = os.getuid()
+    cands = []
+    base = os.environ.get('XDG_RUNTIME_DIR')
+    if base and os.path.isdir(base):
+        cands.append(Path(base) / 'qji')
+    cands.append(Path(tempfile.gettempdir()) / f'qji-{uid}')
+    for d in cands:
+        try:
+            d.mkdir(mode=0o700, exist_ok=True)
+            st = os.lstat(d)
+            if (stat.S_ISDIR(st.st_mode) and st.st_uid == uid
+                    and not (st.st_mode & 0o077)):
+                return d
+        except OSError:
+            continue
+    return Path(tempfile.mkdtemp(prefix='qji-'))
+
+
+def _write_private(path: Path, text: str) -> None:
+    """権限 0600・シンボリックリンク不追従・原子的(replace)に書き込む。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f'.{path.name}.{os.getpid()}.{threading.get_ident()}.tmp')
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+REQUEST_PATH = _private_dir() / 'qji_ytmusic_request.json'
 
 FILTER_PRESET_LABELS = {
     'musikverein': '🎻 Musikverein', 'piano': '🎹 Piano',
@@ -33,6 +72,118 @@ GAIN_PRESETS_DB = {
 _server        = None
 _server_thread = None
 _CLOSE_SIGNAL  = threading.Event()
+_fav_lock      = threading.Lock()
+
+_MAX_BODY   = 2_000_000      # POST ボディ上限(バイト)
+_MAX_TRACKS = 1000           # 1リクエストの曲数上限
+_MAX_IMG    = 8_000_000      # 画像1枚の上限(バイト)
+_VID_RE  = re.compile(r'^[A-Za-z0-9_-]{11}$')
+_BID_RE  = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
+_CTRL_RE = re.compile('[\x00-\x1f\x7f-\x9f\u2028\u2029]')
+_IMG_HOST_SUFFIXES = ('ytimg.com', 'ggpht.com', 'googleusercontent.com')
+
+
+def _valid_vid(v) -> bool:
+    return isinstance(v, str) and bool(_VID_RE.match(v))
+
+
+def _clip(v, n: int) -> str:
+    """文字列のみ受け付け、制御文字を除去して n 文字に切る。"""
+    if not isinstance(v, str):
+        return ''
+    return _CTRL_RE.sub('', v)[:n]
+
+
+def _to_int(v, lo: int, hi: int, default: int = 0) -> int:
+    if isinstance(v, bool):
+        return default
+    try:
+        n = int(v)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return max(lo, min(hi, n))
+
+
+def _https_host(u, maxlen: int = 1000):
+    if not isinstance(u, str) or not u or len(u) > maxlen:
+        return None
+    if _CTRL_RE.search(u) or ' ' in u:
+        return None
+    try:
+        pu = urlparse(u)
+        if pu.scheme != 'https' or pu.username or pu.password:
+            return None
+        if pu.port not in (None, 443):
+            return None
+        return (pu.hostname or '').lower() or None
+    except ValueError:
+        return None
+
+
+def _host_in(host: str, suffixes) -> bool:
+    return any(host == x or host.endswith('.' + x) for x in suffixes)
+
+
+def _is_media_url(u) -> bool:
+    h = _https_host(u, 500)
+    return bool(h) and (h == 'youtu.be' or _host_in(h, ('youtube.com',)))
+
+
+def _is_image_url(u) -> bool:
+    h = _https_host(u, 1000)
+    return bool(h) and _host_in(h, _IMG_HOST_SUFFIXES)
+
+
+def _sniff_img(b: bytes) -> str:
+    if b[:3] == b'\xff\xd8\xff':
+        return 'image/jpeg'
+    if b[:8] == b'\x89PNG\r\n\x1a\n':
+        return 'image/png'
+    if b[:4] == b'RIFF' and b[8:12] == b'WEBP':
+        return 'image/webp'
+    if b[:6] in (b'GIF87a', b'GIF89a'):
+        return 'image/gif'
+    return ''
+
+
+def _clean_track(t):
+    if not isinstance(t, dict) or not _is_media_url(t.get('url')):
+        return None
+    cover = t.get('cover_url') or t.get('art') or ''
+    return {
+        'url':       t['url'],
+        'title':     _clip(t.get('title'), 300),
+        'artist':    _clip(t.get('artist'), 300),
+        'album':     _clip(t.get('album'), 300),
+        'cover_url': cover if _is_image_url(cover) else '',
+        'duration':  _to_int(t.get('duration'), 0, 172800, 0),
+    }
+
+
+def _clean_tracks(raw) -> list:
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for t in raw[:_MAX_TRACKS]:
+        c = _clean_track(t)
+        if c:
+            out.append(c)
+    return out
+
+
+def _clean_audio(a) -> dict:
+    if not isinstance(a, dict):
+        return {}
+    try:
+        if len(json.dumps(a)) > 4096:
+            return {}
+    except (TypeError, ValueError):
+        return {}
+    return {str(k)[:64]: v for k, v in a.items()}
+
+
+def _bad_const(c):
+    raise ValueError(c)      # NaN / Infinity を JSON として受け付けない
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -55,7 +206,7 @@ def _best_thumbnail(thumbs) -> str:
     if isinstance(thumbs, str):
         return thumbs
     try:
-        best = max(thumbs, key=lambda t: t.get('width', 0) * t.get('height', 0))
+        best = max(thumbs, key=lambda t: (t.get('width') or 0) * (t.get('height') or 0))
         url  = best.get('url', '')
     except Exception:
         return ''
@@ -98,7 +249,7 @@ def search_songs(query: str, limit: int = 100) -> dict:
 
     def _ytm_to_item(r) -> dict | None:
         vid = r.get('videoId', '')
-        if not vid or vid in seen:
+        if not _valid_vid(vid) or vid in seen:
             return None
         seen.add(vid)
         dur_sec = r.get('duration_seconds') or _parse_duration(r.get('duration', 0))
@@ -148,7 +299,7 @@ def search_videos(query: str, limit: int = 100) -> dict:
 
     def _ytm_to_item(r) -> dict | None:
         vid = r.get('videoId', '')
-        if not vid or vid in seen:
+        if not _valid_vid(vid) or vid in seen:
             return None
         seen.add(vid)
         dur_sec = r.get('duration_seconds') or _parse_duration(r.get('duration', 0))
@@ -227,7 +378,7 @@ def get_album_detail(browse_id: str) -> Optional[dict]:
         tracks = []
         for t in tracks_raw:
             vid = t.get('videoId', '')
-            if not vid:
+            if not _valid_vid(vid):
                 continue
             artists = _artists_str(t.get('artists') or album.get('artists', []))
             thumbs  = t.get('thumbnails') or album.get('thumbnails', [])
@@ -256,8 +407,10 @@ def get_album_detail(browse_id: str) -> Optional[dict]:
 
 
 def get_playlist_detail(playlist_url: str) -> Optional[dict]:
+    if not _is_media_url(playlist_url):
+        return None
     cmd = ['yt-dlp', '--flat-playlist', '--dump-json',
-           '--no-warnings', '--quiet', playlist_url]
+           '--no-warnings', '--quiet', '--', playlist_url]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
         tracks = []
@@ -268,7 +421,7 @@ def get_playlist_detail(playlist_url: str) -> Optional[dict]:
             try:
                 item = json.loads(line)
                 vid  = item.get('id', '')
-                if not vid:
+                if not _valid_vid(vid):
                     continue
                 thumb = item.get('thumbnail', '')
                 tracks.append({
@@ -300,7 +453,7 @@ def _search_ytdlp(query: str, limit: int = 80) -> dict:
             try:
                 item = json.loads(line)
                 vid  = item.get('id', '')
-                if not vid:
+                if not _valid_vid(vid):
                     continue
                 items.append({
                     'url':      f'https://music.youtube.com/watch?v={vid}',
@@ -319,73 +472,131 @@ def _search_ytdlp(query: str, limit: int = 80) -> dict:
         return {'items': [], 'engine': 'error'}
 
 
-def load_favorites() -> List[dict]:
+def _load_json_list(path: Path) -> list:
     try:
-        return json.loads(FAVS_PATH.read_text()) if FAVS_PATH.exists() else []
+        data = json.loads(path.read_text(encoding='utf-8')) if path.exists() else []
     except Exception:
         return []
+    return [x for x in data if isinstance(x, dict)] if isinstance(data, list) else []
+
+
+def _strs(x: dict, keys) -> None:
+    for k in keys:
+        if not isinstance(x.get(k), str):
+            x[k] = ''
+
+
+def load_favorites() -> List[dict]:
+    out = []
+    for x in _load_json_list(FAVS_PATH):
+        if not isinstance(x.get('url'), str):
+            continue
+        _strs(x, ('title', 'artist', 'album', 'cover_url'))
+        if not isinstance(x.get('audio_settings'), dict):
+            x['audio_settings'] = {}
+        out.append(x)
+    return out
 
 
 def load_album_favorites() -> list:
-    try:
-        return json.loads(ALBUM_FAVS_PATH.read_text()) if ALBUM_FAVS_PATH.exists() else []
-    except Exception:
-        return []
+    out = []
+    for x in _load_json_list(ALBUM_FAVS_PATH):
+        if not isinstance(x.get('browse_id'), str):
+            continue
+        _strs(x, ('title', 'artist', 'year', 'cover_url'))
+        tr = x.get('tracks')
+        x['tracks'] = [t for t in tr if isinstance(t, dict) and isinstance(t.get('url'), str)] \
+            if isinstance(tr, list) else []
+        for t in x['tracks']:
+            _strs(t, ('title', 'artist'))
+        out.append(x)
+    return out
+
 
 def save_album_favorite(browse_id: str, title: str, artist: str,
                         year: str, cover_url: str, tracks: list) -> dict:
-    favs = load_album_favorites()
-    nos  = [f.get('no', 0) for f in favs if isinstance(f.get('no'), int)]
-    no   = (max(nos) + 1) if nos else 1
-    existing = next((i for i, f in enumerate(favs)
-                     if f.get('browse_id') == browse_id), None)
-    entry = {
-        'no':          no if existing is None else favs[existing].get('no', no),
-        'browse_id':   browse_id,
-        'title':       title,
-        'artist':      artist,
-        'year':        year,
-        'cover_url':   cover_url,
-        'track_count': len(tracks),
-        'tracks':      tracks,
-        'saved_at':    __import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-    }
-    if existing is not None:
-        favs[existing] = entry
-    else:
-        favs.append(entry)
-    ALBUM_FAVS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    ALBUM_FAVS_PATH.write_text(json.dumps(favs, ensure_ascii=False, indent=2))
+    with _fav_lock:
+        favs = load_album_favorites()
+        nos  = [f.get('no', 0) for f in favs if isinstance(f.get('no'), int)]
+        no   = (max(nos) + 1) if nos else 1
+        existing = next((i for i, f in enumerate(favs)
+                         if f.get('browse_id') == browse_id), None)
+        entry = {
+            'no':          no if existing is None else favs[existing].get('no', no),
+            'browse_id':   browse_id,
+            'title':       title,
+            'artist':      artist,
+            'year':        year,
+            'cover_url':   cover_url,
+            'track_count': len(tracks),
+            'tracks':      tracks,
+            'saved_at':    time.strftime('%Y-%m-%d %H:%M:%S'),
+        }
+        if existing is not None:
+            favs[existing] = entry
+        else:
+            favs.append(entry)
+        _write_private(ALBUM_FAVS_PATH, json.dumps(favs, ensure_ascii=False, indent=2))
     return entry
 
 
 def fetch_cover(url: str) -> bytes:
-    if not url:
+    """YouTube 系の画像ホストだけを取得する。リダイレクトは1ホップずつ検証。"""
+    if not _is_image_url(url):
         return b''
     try:
         import requests
-        headers = {
-            'User-Agent':
-                'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
-                '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Referer': 'https://music.youtube.com/',
-            'Accept':  'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
-            'Accept-Language': 'ja,en-US;q=0.9',
-        }
-        r = requests.get(url, timeout=12, headers=headers, allow_redirects=True)
-        if r.status_code == 200 and r.content:
-            return r.content
+    except Exception:
+        return b''
+    headers = {
+        'User-Agent':
+            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
+            '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Referer': 'https://music.youtube.com/',
+        'Accept':  'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+        'Accept-Language': 'ja,en-US;q=0.9',
+    }
+
+    def _get(u: str) -> bytes:
+        cur = u
+        for _ in range(4):
+            if not _is_image_url(cur):
+                return b''
+            r = requests.get(cur, timeout=10, headers=headers,
+                             allow_redirects=False, stream=True)
+            try:
+                if r.status_code in (301, 302, 303, 307, 308):
+                    cur = urljoin(cur, r.headers.get('Location', ''))
+                    continue
+                if r.status_code != 200:
+                    return b''
+                if not r.headers.get('Content-Type', '').lower().startswith('image/'):
+                    return b''
+                buf = bytearray()
+                for chunk in r.iter_content(65536):
+                    buf += chunk
+                    if len(buf) > _MAX_IMG:
+                        return b''
+                return bytes(buf)
+            finally:
+                r.close()
+        return b''
+
+    try:
+        data = _get(url)
+        if data:
+            return data
         # 403 等 → yt thumbnail の代替 URL を試みる
         if 'ytimg.com' in url:
             for quality in ('maxresdefault', 'hqdefault', 'mqdefault', 'default'):
-                alt = __import__('re').sub(
+                alt = re.sub(
                     r'/(maxresdefault|hqdefault|mqdefault|sddefault|default)(\.jpg)',
                     f'/{quality}\\2', url)
                 if alt == url:
                     break
-                r2 = requests.get(alt, timeout=8, headers=headers, allow_redirects=True)
-                if r2.status_code == 200 and r2.content:
-                    return r2.content
+                data = _get(alt)
+                if data:
+                    return data
         return b''
     except Exception:
         return b''
@@ -399,10 +610,33 @@ def _esc(s: str) -> str:
     return str(s).replace('&','&amp;').replace('<','&lt;').replace('>','&gt;').replace('"','&quot;')
 
 def _js(s: str) -> str:
+    # 旧版。onclick 属性内では安全でないため使用しない（_jsarg を使う）
     return _esc(str(s)).replace("'","&#39;")
 
+def _jsarg(v) -> str:
+    """HTML 属性(ダブルクォート)内の JS 引数。JSON 文字列として出力し、属性用にエスケープ。"""
+    return _esc(json.dumps(v, ensure_ascii=True))
+
+def _json_in_script(obj) -> str:
+    """<script type="application/json"> 内に安全に埋め込める JSON。"""
+    return (json.dumps(obj, ensure_ascii=False)
+            .replace('<', '\\u003c').replace('>', '\\u003e').replace('&', '\\u0026')
+            .replace('\u2028', '\\u2028').replace('\u2029', '\\u2029'))
+
+def _di(v) -> int:
+    return _to_int(v, 0, 10**9, 0)
+
+def _no3(v) -> str:
+    try:
+        return f'{int(v):03d}'
+    except (TypeError, ValueError, OverflowError):
+        return '000'
+
 def _dur_str(sec: int) -> str:
-    sec = int(sec)
+    try:
+        sec = int(sec)
+    except (TypeError, ValueError, OverflowError):
+        return ''
     if not sec: return ''
     if sec >= 3600:
         return f'{sec//3600}:{(sec%3600)//60:02d}:{sec%60:02d}'
@@ -869,7 +1103,7 @@ def _track_cards(items: list, engine: str) -> str:
             f' data-artist="{_esc(t["artist"])}"'
             f' data-album="{_esc(t.get("album",""))}"'
             f' data-art="{_esc(t.get("art",""))}"'
-            f' data-dur="{t.get("duration",0)}"'
+            f' data-dur="{_di(t.get("duration"))}"'
             f' onclick="toggleSelect(event)">'
         )
         cards.append(
@@ -879,7 +1113,7 @@ def _track_cards(items: list, engine: str) -> str:
             f' data-artist="{_esc(t["artist"])}"'
             f' data-album="{_esc(t.get("album",""))}"'
             f' data-art="{_esc(t.get("art",""))}"'
-            f' data-dur="{t.get("duration",0)}"'
+            f' data-dur="{_di(t.get("duration"))}"'
             f' onclick="onCardClick(this)">'
             f'{cb}'
             f'<div class="cov">{art_html}{dur_badge}</div>'
@@ -908,7 +1142,8 @@ def page_search_songs(query: str, limit: int = 80) -> str:
         {'url': t['url'], 'title': t['title'], 'artist': t['artist'],
          'album': t.get('album',''), 'cover_url': t.get('art',''), 'duration': t.get('duration',0)}
         for t in items
-    ], ensure_ascii=False).replace("'","&#39;").replace('"','&quot;')
+    ], ensure_ascii=False)
+    all_json = _jsarg(all_json)
 
     engine_badge = f'<span class="engine-badge">{engine}</span>'
     # 「もっと読み込む」ボタン（さらに多く取得する場合）
@@ -929,7 +1164,7 @@ def page_search_songs(query: str, limit: int = 80) -> str:
         f'style="padding:4px 12px;background:var(--hover);border:1px solid var(--border);'
         f'border-radius:7px;color:var(--muted);cursor:pointer;font-size:.76rem;white-space:nowrap">'
         f'☑ Select all / Deselect</button>'
-        f'<button onclick="playPlaylist(\'{all_json}\')" '
+        f'<button onclick="playPlaylist({all_json})" '
         f'style="margin-left:auto;padding:5px 16px;background:var(--hover);'
         f'border:1px solid var(--border);border-radius:7px;color:var(--muted);'
         f'cursor:pointer;font-size:.8rem;font-weight:600;white-space:nowrap">'
@@ -999,8 +1234,8 @@ def page_search_albums(query: str) -> str:
         art_html = (f'<img src="/cover?url={quote(a["art"])}" loading="lazy" alt="">'
                     if a.get('art') else '<div class="ni">💿</div>')
         kind  = a.get('type', 'Album')
-        tc    = f'<span>{a["track_count"]} tracks</span>' if a.get('track_count') else ''
-        year  = f'<span>{a["year"]}</span>'           if a.get('year')        else ''
+        tc    = f'<span>{_di(a["track_count"])} tracks</span>' if a.get('track_count') else ''
+        year  = f'<span>{_esc(a["year"])}</span>'           if a.get('year')        else ''
         cards.append(
             f'<a class="card" href="/album?id={quote(a["browse_id"])}">'
             f'<div class="cov">{art_html}'
@@ -1046,7 +1281,7 @@ def page_album(browse_id: str) -> str:
             f' data-artist="{_esc(t["artist"])}"'
             f' data-album="{_esc(t.get("album",""))}"'
             f' data-art="{_esc(t.get("art",""))}"'
-            f' data-dur="{t.get("duration",0)}"'
+            f' data-dur="{_di(t.get("duration"))}"'
             f' onclick="toggleSelect(event)">'
         )
         rows.append(
@@ -1056,7 +1291,7 @@ def page_album(browse_id: str) -> str:
             f' data-artist="{_esc(t["artist"])}"'
             f' data-album="{_esc(t.get("album",""))}"'
             f' data-art="{_esc(t.get("art",""))}"'
-            f' data-dur="{t.get("duration",0)}"'
+            f' data-dur="{_di(t.get("duration"))}"'
             f' onclick="onTrackClick(this)">'
             f'{cb}'
             f'<span class="tno">{i}</span>'
@@ -1080,7 +1315,7 @@ def page_album(browse_id: str) -> str:
 
     # <script id='album-data'> にアルバム全データを埋め込む
     # onclick 属性へのJSON渡しはアポストロフィで壊れるため script タグ方式を採用
-    album_script_data = json.dumps({
+    album_script_data = _json_in_script({
         'browse_id':  browse_id,
         'title':      detail['title'],
         'artist':     detail['artist'],
@@ -1094,7 +1329,7 @@ def page_album(browse_id: str) -> str:
              'duration':  t.get('duration', 0)}
             for t in tracks
         ],
-    }, ensure_ascii=False).replace('</', '<\\/')
+    })
     body = f"""<div class="pp">
 <a href="javascript:history.back()" style="display:inline-flex;align-items:center;
 gap:4px;padding:5px 12px;background:var(--hover);border:1px solid var(--border);
@@ -1125,28 +1360,27 @@ def page_favorites() -> str:
     album_favs = load_album_favorites()
     album_rows = []
     for a in album_favs:
-        tracks_json_a = (json.dumps([
+        tracks_json_a = (_esc(json.dumps([
             {'url': t['url'], 'title': t['title'], 'artist': t['artist'],
              'album': t.get('album', a['title']),
              'cover_url': t.get('cover_url', t.get('art', a.get('cover_url', ''))),
              'duration': t.get('duration', 0)}
             for t in a.get('tracks', [])
-        ], ensure_ascii=False)
-            .replace("'", "&#39;").replace('"', '&quot;'))
+        ], ensure_ascii=False)))
         art_html = (
             f'<img class="fav-art" src="/cover?url={quote(a.get("cover_url",""))}"'
             f' loading="lazy" alt="">'
             if a.get('cover_url') else '<div class="fav-ni">\U0001f4bf</div>'
         )
-        tc   = a.get('track_count', len(a.get('tracks', [])))
+        tc   = _di(a.get('track_count', len(a.get('tracks', []))))
         year = ('  ' + a['year']) if a.get('year') else ''
-        bid_js = _js(a['browse_id'])
+        bid_js = _jsarg(a['browse_id'])
         del_btn = (
             '<button class="fav-del" title="\u524a\u9664"'
-            f' onclick="deleteAlbumFav(event,\'{bid_js}\')">\U0001f5d1</button>'
+            f' onclick="deleteAlbumFav(event,{bid_js})">\U0001f5d1</button>'
         )
         album_rows.append(
-            f'<div class="fav-item album-fav-item" data-tracks=\'{tracks_json_a}\''
+            f'<div class="fav-item album-fav-item" data-tracks="{tracks_json_a}"'
             f' onclick="playAlbumFav(this)">'
             + art_html
             + '<div class="fav-info">'
@@ -1154,7 +1388,7 @@ def page_favorites() -> str:
             + f'<div class="fav-artist">{_esc(a["artist"])}{_esc(year)}</div>'
             + f'<div class="fav-album">{tc}\u66f2</div>'
             + '</div>'
-            + f'<span class="fav-no">#{a.get("no",0):03d}</span>'
+            + f'<span class="fav-no">#{_no3(a.get("no"))}</span>'
             + del_btn
             + '</div>'
         )
@@ -1176,12 +1410,9 @@ def page_favorites() -> str:
         gp_db = GAIN_PRESETS_DB.get(audio.get('gain_preset', ''))
         vol   = audio.get('volume')
         gp_lb = (f'🔊{gp_db:+.1f}dB' if gp_db is not None else '')
-        vl_lb = (f'Vol:{vol}dB'       if vol is not None   else '')
+        vl_lb = (f'Vol:{_esc(vol)}dB'       if vol is not None   else '')
         preset_display = '  '.join(x for x in [fp_lb, gp_lb, vl_lb] if x)
-        audio_json = (json.dumps(audio, ensure_ascii=False)
-                         .replace('\\','\\\\')
-                         .replace("'","&#39;")
-                         .replace('"','&quot;'))
+        audio_json = _jsarg(json.dumps(audio, ensure_ascii=False))
         cb = (
             f'<input type="checkbox" class="sel-cb"'
             f' data-url="{_esc(f["url"])}"'
@@ -1189,20 +1420,20 @@ def page_favorites() -> str:
             f' data-artist="{_esc(f["artist"])}"'
             f' data-album="{_esc(f.get("album",""))}"'
             f' data-art="{_esc(f.get("cover_url",""))}"'
-            f' data-dur="{f.get("duration",0)}"'
+            f' data-dur="{_di(f.get("duration"))}"'
             f' onclick="toggleSelect(event)">'
         )
         del_btn = (
             f'<button class="fav-del" title="Remove"'
-            f' onclick="deleteFav(event,\'{_js(f["url"])}\')">🗑</button>'
+            f' onclick="deleteFav(event,{_jsarg(f["url"])})">🗑</button>'
         )
         album_line = (f'<div class="fav-album">{_esc(f["album"])}</div>'
                       if f.get('album') else '')
         rows.append(
-            f'<div class="fav-item" onclick="playFavorite(\'{_js(f["url"])}\','
-            f'\'{_js(f["title"])}\',\'{_js(f["artist"])}\','
-            f'\'{_js(f.get("album",""))}\',\'{_js(f.get("cover_url",""))}\','
-            f'{f.get("duration",0)},\'{audio_json}\')">'
+            f'<div class="fav-item" onclick="playFavorite({_jsarg(f["url"])},'
+            f'{_jsarg(f["title"])},{_jsarg(f["artist"])},'
+            f'{_jsarg(f.get("album",""))},{_jsarg(f.get("cover_url",""))},'
+            f'{_di(f.get("duration"))},{audio_json})">'
             f'{cb}'
             f'{art_html}'
             f'<div class="fav-info">'
@@ -1211,17 +1442,17 @@ def page_favorites() -> str:
             f'{album_line}'
             f'<div class="fav-preset">{preset_display}</div>'
             f'</div>'
-            f'<span class="fav-no">#{f.get("no",0):03d}</span>'
+            f'<span class="fav-no">#{_no3(f.get("no"))}</span>'
             f'{del_btn}'
             f'</div>'
         )
 
-    favs_json = json.dumps([
+    favs_json = _json_in_script([
         {'url': f['url'], 'title': f['title'], 'artist': f['artist'],
          'album': f.get('album',''), 'cover_url': f.get('cover_url',''),
-         'duration': f.get('duration',0)}
+         'duration': _di(f.get('duration'))}
         for f in favs
-    ], ensure_ascii=False)
+    ])
 
     if favs:
         toolbar = (
@@ -1263,11 +1494,46 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
+    def _sec_headers(self, html: bool = False):
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('Referrer-Policy', 'no-referrer')
+        self.send_header('Cross-Origin-Resource-Policy', 'same-origin')
+        if html:
+            self.send_header('X-Frame-Options', 'DENY')
+            self.send_header(
+                'Content-Security-Policy',
+                "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; "
+                "script-src 'unsafe-inline'; connect-src 'self'; "
+                "form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+
+    def _guard(self, post: bool = False) -> bool:
+        """Host / Origin / Content-Type を検証する（DNS リバインディング・CSRF 対策）。"""
+        port = self.server.server_address[1]
+        host = (self.headers.get('Host') or '').lower()
+        if host not in {f'localhost:{port}', f'127.0.0.1:{port}', f'[::1]:{port}'}:
+            self._json({'ok': False, 'error': 'forbidden'}, 403)
+            return False
+        if post:
+            origin = self.headers.get('Origin')
+            if origin is not None and origin != f'http://{host}':
+                self._json({'ok': False, 'error': 'forbidden origin'}, 403)
+                return False
+            site = self.headers.get('Sec-Fetch-Site')
+            if site is not None and site not in ('same-origin', 'none'):
+                self._json({'ok': False, 'error': 'forbidden'}, 403)
+                return False
+            ctype = (self.headers.get('Content-Type') or '').split(';')[0].strip().lower()
+            if ctype != 'application/json':
+                self._json({'ok': False, 'error': 'unsupported media type'}, 415)
+                return False
+        return True
+
     def _send(self, html: str, code: int = 200):
         data = html.encode('utf-8')
         self.send_response(code)
         self.send_header('Content-Type', 'text/html; charset=utf-8')
         self.send_header('Content-Length', len(data))
+        self._sec_headers(html=True)
         self.end_headers()
         try:
             self.wfile.write(data)
@@ -1279,6 +1545,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', len(data))
+        self.send_header('Cache-Control', 'no-store')
+        self._sec_headers()
         self.end_headers()
         try:
             self.wfile.write(data)
@@ -1288,10 +1556,14 @@ class Handler(BaseHTTPRequestHandler):
     def _img(self, data: bytes):
         if not data:
             self.send_response(204); self.end_headers(); return
+        ctype = _sniff_img(data)
+        if not ctype:
+            self.send_response(204); self.end_headers(); return
         self.send_response(200)
-        self.send_header('Content-Type', 'image/jpeg')
+        self.send_header('Content-Type', ctype)
         self.send_header('Content-Length', len(data))
         self.send_header('Cache-Control', 'max-age=3600')
+        self._sec_headers()
         self.end_headers()
         try:
             self.wfile.write(data)
@@ -1299,13 +1571,15 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def do_GET(self):
+        if not self._guard():
+            return
         pars = urlparse(self.path)
         qs   = parse_qs(pars.query)
-        def q(k, d=''): return unquote(qs.get(k, [''])[0]) or d
+        def q(k, d=''): return qs.get(k, [''])[0] or d   # parse_qs でデコード済み
         path = pars.path
 
         if path in ('/', '/search'):
-            query = q('q')
+            query = _clip(q('q'), 200).strip()
             tab   = q('tab', 'songs')
             try:
                 limit = int(qs.get('limit', ['80'])[0])
@@ -1320,7 +1594,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(page_search_songs(query, limit=limit))
 
         elif path == '/album':
-            self._send(page_album(q('id')))
+            bid = q('id')
+            if bid and not _BID_RE.match(bid):
+                self._send('<p>Bad Request</p>', code=400)
+            else:
+                self._send(page_album(bid))
 
         elif path == '/favorites':
             self._send(page_favorites())
@@ -1336,112 +1614,139 @@ class Handler(BaseHTTPRequestHandler):
             self._send('<p>Not Found</p>', code=404)
 
     def do_POST(self):
-        pars = urlparse(self.path)
-        path = pars.path
+        if not self._guard(post=True):
+            return
+        path = urlparse(self.path).path
         try:
             length = int(self.headers.get('Content-Length', 0))
-            body   = json.loads(self.rfile.read(length)) if length else {}
+        except ValueError:
+            length = -1
+        if length < 0 or length > _MAX_BODY:
+            self._json({'ok': False, 'error': 'invalid or oversized request'}, 413)
+            return
+        try:
+            body = (json.loads(self.rfile.read(length), parse_constant=_bad_const)
+                    if length else {})
+            if not isinstance(body, dict):
+                body = {}
         except Exception:
             body = {}
 
         if path == '/play':
-            req_type = body.get('type', 'track')
-
-            if req_type == 'playlist':
-                tracks = body.get('tracks', [])
+            if body.get('type', 'track') == 'playlist':
+                tracks = _clean_tracks(body.get('tracks'))
                 if not tracks:
-                    self._json({'ok': False, 'error': 'tracks are empty'}, 400)
+                    self._json({'ok': False, 'error': 'no playable tracks'}, 400)
                     return
                 req = {
                     'type':         'playlist',
                     'tracks':       tracks,
-                    'start_from':   body.get('start_from', 1),
+                    'start_from':   _to_int(body.get('start_from', 1), 1, len(tracks), 1),
                     'requested_at': time.time(),
                 }
                 try:
-                    REQUEST_PATH.write_text(json.dumps(req, ensure_ascii=False))
+                    _write_private(REQUEST_PATH, json.dumps(req, ensure_ascii=False))
                     print(f'\n  📋 Playlist play request: {len(tracks)} tracks')
                     self._json({'ok': True})
                 except Exception as e:
-                    self._json({'ok': False, 'error': str(e)}, 500)
+                    print(f'  ⚠ Request write error: {e}')
+                    self._json({'ok': False, 'error': 'write failed'}, 500)
 
             else:
-                url = body.get('url', '')
-                if not url:
-                    self._json({'ok': False, 'error': 'URL required'}, 400)
+                t = _clean_track({
+                    'url':       body.get('url'),
+                    'title':     body.get('title'),
+                    'artist':    body.get('artist'),
+                    'album':     body.get('album'),
+                    'cover_url': body.get('cover_url'),
+                    'duration':  body.get('duration'),
+                })
+                if not t:
+                    self._json({'ok': False, 'error': 'a YouTube URL is required'}, 400)
                     return
                 req = {
                     'type':           'track',
-                    'url':            url,
-                    'title':          body.get('title', ''),
-                    'artist':         body.get('artist', ''),
-                    'album':          body.get('album', ''),
-                    'cover_url':      body.get('cover_url', ''),
-                    'duration':       body.get('duration', 0),
-                    'audio_settings': body.get('audio_settings', {}),
+                    'url':            t['url'],
+                    'title':          t['title'],
+                    'artist':         t['artist'],
+                    'album':          t['album'],
+                    'cover_url':      t['cover_url'],
+                    'duration':       t['duration'],
+                    'audio_settings': _clean_audio(body.get('audio_settings')),
                     'requested_at':   time.time(),
                 }
                 try:
-                    REQUEST_PATH.write_text(json.dumps(req, ensure_ascii=False))
-                    title = req['title'] or url
-                    print(f'\n  📱 Browser play: {req["artist"]} — {title}')
+                    _write_private(REQUEST_PATH, json.dumps(req, ensure_ascii=False))
+                    print(f'\n  📱 Browser play: {req["artist"]} — {req["title"] or req["url"]}')
                     self._json({'ok': True})
                 except Exception as e:
-                    self._json({'ok': False, 'error': str(e)}, 500)
+                    print(f'  ⚠ Request write error: {e}')
+                    self._json({'ok': False, 'error': 'write failed'}, 500)
 
         elif path == '/api/delete_favorite':
             url = body.get('url', '')
-            if not url:
+            if not isinstance(url, str) or not url or len(url) > 500:
                 self._json({'ok': False, 'error': 'URL required'}, 400)
                 return
             try:
-                favs     = load_favorites()
-                new_favs = [f for f in favs if f.get('url') != url]
-                if len(new_favs) == len(favs):
+                with _fav_lock:
+                    favs     = load_favorites()
+                    new_favs = [f for f in favs if f.get('url') != url]
+                    found    = len(new_favs) != len(favs)
+                    if found:
+                        _write_private(FAVS_PATH, json.dumps(
+                            new_favs, ensure_ascii=False, indent=2))
+                if not found:
                     self._json({'ok': False, 'error': 'not found'}, 404)
                     return
-                FAVS_PATH.write_text(
-                    json.dumps(new_favs, ensure_ascii=False, indent=2))
-                print(f'\n  🗑 Favourite removed: {url[:60]}')
+                print(f'\n  🗑 Favourite removed: {_clip(url, 60)}')
                 self._json({'ok': True})
             except Exception as e:
-                self._json({'ok': False, 'error': str(e)}, 500)
-
+                print(f'  ⚠ Favourite removal error: {e}')
+                self._json({'ok': False, 'error': 'removal failed'}, 500)
 
         elif path == '/api/save_album':
             browse_id = body.get('browse_id', '')
-            title     = body.get('title', '')
-            if not browse_id or not title:
-                self._json({'ok': False, 'error': 'browse_id / title required'}, 400); return
+            title     = _clip(body.get('title'), 300)
+            if not isinstance(browse_id, str) or not _BID_RE.match(browse_id) or not title:
+                self._json({'ok': False, 'error': 'browse_id / title required'}, 400)
+                return
+            tracks = _clean_tracks(body.get('tracks'))
+            cover  = body.get('cover_url')
+            cover  = cover if _is_image_url(cover) else ''
             try:
-                tracks = body.get('tracks', [])
-                entry  = save_album_favorite(
+                entry = save_album_favorite(
                     browse_id, title,
-                    body.get('artist', ''),
-                    body.get('year', ''),
-                    body.get('cover_url', ''),
-                    tracks,
-                )
+                    _clip(body.get('artist'), 300),
+                    _clip(body.get('year'), 16),
+                    cover, tracks)
                 print(f'\n  💾 Album saved: {title} ({len(tracks)} tracks)')
                 self._json({'ok': True, 'title': title,
                             'no': entry['no'], 'track_count': len(tracks)})
             except Exception as e:
-                self._json({'ok': False, 'error': str(e)}, 500)
+                print(f'  ⚠ Album save error: {e}')
+                self._json({'ok': False, 'error': 'save failed'}, 500)
 
         elif path == '/api/delete_album_favorite':
             browse_id = body.get('browse_id', '')
-            if not browse_id:
-                self._json({'ok': False, 'error': 'browse_id required'}, 400); return
+            if not isinstance(browse_id, str) or not _BID_RE.match(browse_id):
+                self._json({'ok': False, 'error': 'browse_id required'}, 400)
+                return
             try:
-                favs     = load_album_favorites()
-                new_favs = [f for f in favs if f.get('browse_id') != browse_id]
-                if len(new_favs) == len(favs):
-                    self._json({'ok': False, 'error': 'not found'}, 404); return
-                ALBUM_FAVS_PATH.write_text(
-                    json.dumps(new_favs, ensure_ascii=False, indent=2))
+                with _fav_lock:
+                    favs     = load_album_favorites()
+                    new_favs = [f for f in favs if f.get('browse_id') != browse_id]
+                    found    = len(new_favs) != len(favs)
+                    if found:
+                        _write_private(ALBUM_FAVS_PATH, json.dumps(
+                            new_favs, ensure_ascii=False, indent=2))
+                if not found:
+                    self._json({'ok': False, 'error': 'not found'}, 404)
+                    return
                 self._json({'ok': True})
             except Exception as e:
-                self._json({'ok': False, 'error': str(e)}, 500)
+                print(f'  ⚠ Album removal error: {e}')
+                self._json({'ok': False, 'error': 'removal failed'}, 500)
         else:
             self._send('<p>Not Found</p>', code=404)
 
@@ -1455,7 +1760,9 @@ def start_browser_server(port: int = PORT, open_browser: bool = True) -> bool:
     if _server:
         return True
     try:
-        _server = HTTPServer(('0.0.0.0', port), Handler)
+        # このPC専用: 127.0.0.1 のみで待ち受ける（LAN には公開しない）
+        _server = ThreadingHTTPServer(('127.0.0.1', port), Handler)
+        _server.daemon_threads = True
         _server_thread = threading.Thread(
             target=_server.serve_forever, daemon=True)
         _server_thread.start()
@@ -1470,15 +1777,23 @@ def start_browser_server(port: int = PORT, open_browser: bool = True) -> bool:
                 pass
         return True
     except Exception as e:
+        _server = None
         print(f'  ⚠ Browser UI launch failed: {e}')
         return False
 
 
 def stop_browser_server():
     global _server
-    if _server:
-        _server.shutdown()
-        _server = None
+    srv, _server = _server, None
+    if srv:
+        try:
+            srv.shutdown()
+        except Exception:
+            pass
+        try:
+            srv.server_close()      # ポートを確実に解放する
+        except Exception:
+            pass
 
 
 def send_close_signal():
@@ -1489,18 +1804,37 @@ def send_close_signal():
     threading.Thread(target=_reset, daemon=True).start()
 
 
+def _drop_request():
+    try:
+        REQUEST_PATH.unlink()
+    except OSError:
+        pass
+
+
 def check_browser_request() -> Optional[dict]:
-    if not REQUEST_PATH.exists():
+    try:
+        st = os.lstat(REQUEST_PATH)
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+        _drop_request()
         return None
     try:
-        req = json.loads(REQUEST_PATH.read_text())
-        if time.time() - req.get('requested_at', 0) > 10:
-            REQUEST_PATH.unlink(missing_ok=True)
-            return None
-        REQUEST_PATH.unlink(missing_ok=True)
-        return req
+        req = json.loads(REQUEST_PATH.read_text(encoding='utf-8'),
+                         parse_constant=_bad_const)
     except Exception:
+        _drop_request()          # 壊れたファイルを残さない
         return None
+    _drop_request()
+    if not isinstance(req, dict):
+        return None
+    try:
+        age = time.time() - float(req.get('requested_at', 0))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if age > 10:
+        return None
+    return req
 
 
 # ═══════════════════════════════════════════════════════════════════════════
