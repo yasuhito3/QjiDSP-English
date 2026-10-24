@@ -12,7 +12,7 @@ A hi-fi music playback system for Linux. In addition to local file playback, it 
 ## Features
 
 - **Local playback**: browse by album art, folder playback, search by composer / performer / conductor / genre / mood
-- **Streaming**: Qobuz (Hi-Res), SoundCloud, YouTube Music (`yt-dlp` + `ytmusicapi`)
+- **Streaming**: Qobuz (Hi-Res), SoundCloud (fetched directly through the SoundCloud API), YouTube Music (`yt-dlp` + `ytmusicapi`)
 - **3D spatial audio extension (QjiDSP)**: a DSP pipeline through a virtual sound card (ALSA Loopback) powered by CamillaDSP, with six soundfield presets:
   1. Rich hall (static) — full EQ chain, calm reverb
   2. Rich hall (dynamic) — full EQ chain, gentle airflow modulation
@@ -130,6 +130,26 @@ Playback itself works via `yt-dlp` search even without this.
 > - Only YouTube / YouTube Music URLs can be played. Cover art is likewise fetched only from YouTube / Google image hosts.
 > - If a package such as `ytmusicapi` is missing, Qji shows the command it would run and asks for confirmation before installing it (the default is "no").
 
+### SoundCloud
+
+No login or authentication setup is needed. The `client_id` used for search and playback is fetched from the SoundCloud website automatically and refreshed when it expires (it is stored in `~/.config/qji_soundcloud.json`, with file permissions `600`).
+
+Both tracks and playlists (`/sets/…`) are fetched directly through the SoundCloud API. `yt-dlp` is used only as a fallback when the API cannot return the result.
+
+> 🔒 **About security**
+> - The SoundCloud browser UI (port 8081) accepts connections **only from this PC itself (127.0.0.1)**. It cannot be opened from a smartphone or other device on your network. It also rejects requests triggered from other websites (CSRF and DNS rebinding).
+> - Only SoundCloud (`soundcloud.com`) URLs can be played. Cover art is likewise fetched only from SoundCloud's image hosts.
+> - Stream URLs returned by SoundCloud are used only if they are `https` on SoundCloud's delivery hosts. ffmpeg is started with `-protocol_whitelist`, so it cannot be made to read local things such as `file:`.
+> - Terminal control sequences are stripped from track titles and other external strings before they are displayed.
+> - The play-request hand-off file and the temporary cover-art file are kept not in the shared `/tmp` but in a folder of your own (`$XDG_RUNTIME_DIR/qji`, or `/tmp/qji-<UID>` if that is not set), with permissions `600`.
+> - If you point Qji at a cookie file for `yt-dlp`, it checks the file's owner and permissions when loading it, and automatically tightens them to `600` if needed.
+> - If `requests` is missing, Qji shows the command it would run and asks for confirmation before installing it (the default is "no").
+
+> ℹ️ **About playback**
+> - In DSP mode (when you choose "Loopback" as the output device), ffmpeg converts the audio to 48000Hz before handing it to CamillaDSP. With direct output, the audio stays at SoundCloud's native 44.1kHz.
+> - The Peak Monitor display also works with SoundCloud playback.
+> - Tracks that SoundCloud protects with **DRM** cannot be played with ffmpeg. Qji skips them automatically (a different upload of the same piece may play fine).
+
 ### Voice control (Vosk)
 
 Enabled automatically once a Japanese speech recognition model is placed at:
@@ -214,6 +234,30 @@ deno --version       # if it's older: deno upgrade
 Re-running the installer (`install_qjidsp.sh`) performs these updates and checks automatically.
 
 ---
+
+**If SoundCloud won't play**
+
+When playback starts, the screen shows clues about what is and isn't playable.
+
+- `📡 Available: …` ── the list of delivery formats that can be played for that track, plus how many were excluded because they are encrypted (DRM). If one format fails (e.g. `HTTP 404`), the next format is tried automatically.
+- `🔒 This track is DRM-protected and cannot be played — skipping` ── SoundCloud protects this track with DRM. ffmpeg cannot play it, so it is skipped by design. Updating `yt-dlp` does not change this.
+- `Not using this format — the delivery host is not allowed …` ── SoundCloud may have started using a new delivery host. Please open an Issue and include the host name shown.
+- `HTTP 401` / `403` keeps appearing ── the saved `client_id` may have expired. It is normally refreshed automatically, but if that doesn't help, delete the saved `client_id` with the following command and try playing again.
+
+```bash
+python3 - <<'EOF'
+import json, pathlib
+p = pathlib.Path.home()/'.config'/'qji_soundcloud.json'
+c = json.loads(p.read_text()); c.pop('client_id', None); c.pop('client_id_fetched_at', None)
+p.write_text(json.dumps(c, ensure_ascii=False, indent=2))
+EOF
+```
+
+SoundCloud playback does not depend on `yt-dlp`, so an out-of-date `yt-dlp` normally has no effect on it (`yt-dlp` is used only as a fallback).
+
+---
+
+
 
 ## Directory layout (after installation)
 

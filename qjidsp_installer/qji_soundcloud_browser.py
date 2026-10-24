@@ -9,17 +9,19 @@ qji_soundcloud_browser.py  —  SoundCloud ブラウザUI  (ポート 8081)
   ・ブラウザ上でトラック選択 → ターミナルで即再生
 """
 
-import json, time, threading, subprocess, sys, re
+import os, json, time, threading, subprocess, sys, re, tempfile
+import stat as _stat
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs, quote, unquote
+from urllib.parse import urlparse, parse_qs, quote
+from urllib.parse import urlparse as _urlparse, urljoin as _urljoin
 from typing import Optional, List
 
 PORT          = 8081
+BIND_HOST     = '127.0.0.1'      # use only from this PC (not exposed to the LAN)
 FAVS_PATH        = Path.home() / '.config' / 'qji_soundcloud_favorites.json'
 PLAYLISTS_PATH   = Path.home() / '.config' / 'qji_soundcloud_playlists.json'
 CONFIG_PATH   = Path.home() / '.config' / 'qji_soundcloud.json'
-REQUEST_PATH  = Path('/tmp/qji_soundcloud_request.json')
 SC_API_BASE   = 'https://api-v2.soundcloud.com'
 SC_AGENT      = ('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
                  '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
@@ -44,6 +46,224 @@ GAIN_PRESET_LABELS = {
     'jazz_pop':  'Jazz/Pop',  'loud':    'Loud',
 }
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Security helpers (functions for not blindly trusting URLs, strings and files that come from outside)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Only SoundCloud URLs (including subdomains) may be played or fetched
+_ALLOWED_MEDIA_HOSTS  = ('soundcloud.com',)
+# Hosts for SoundCloud API v2 and the transcoding URLs it returns
+_ALLOWED_API_HOSTS    = ('soundcloud.com', 'sndcdn.com')
+# Hosts that serve the actual audio stream (the only hosts whose URLs may be passed to ffmpeg)
+_ALLOWED_STREAM_HOSTS = ('sndcdn.com', 'soundcloud.com', 'soundcloud.cloud')
+# Hosts cover art may be fetched from
+_ALLOWED_IMAGE_HOSTS  = ('sndcdn.com', 'soundcloud.com')
+# Hosts the JavaScript used for client_id extraction may be fetched from
+_ALLOWED_SCRIPT_HOSTS = ('sndcdn.com',)
+_MAX_IMAGE_BYTES  = 8 * 1024 * 1024
+_MAX_JSON_BYTES   = 8 * 1024 * 1024
+_MAX_SCRIPT_BYTES = 8 * 1024 * 1024
+_ANSI_RE = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]')
+_CTRL_RE = re.compile(r'[\x00-\x1f\x7f-\x9f]')
+
+
+def _host_allowed(host, allowed) -> bool:
+    host = (host or '').lower().rstrip('.')
+    return any(host == h or host.endswith('.' + h) for h in allowed)
+
+
+def _safe_url(url, allowed_hosts, schemes) -> Optional[str]:
+    """Return the URL only if it points at an allowed host. Anything else (strings starting with '-', control characters,
+    other hosts, embedded credentials, unusual ports, etc.) gives None."""
+    if not isinstance(url, str):
+        return None
+    url = url.strip()
+    if not url or len(url) > 2000 or url.startswith('-') or _CTRL_RE.search(url) or ' ' in url:
+        return None
+    try:
+        u = _urlparse(url)
+        port = u.port
+    except ValueError:
+        return None
+    if u.scheme not in schemes or u.username or u.password or port not in (None, 80, 443):
+        return None
+    if not _host_allowed(u.hostname, allowed_hosts):
+        return None
+    return url
+
+
+def _safe_media_url(url) -> Optional[str]:
+    return _safe_url(url, _ALLOWED_MEDIA_HOSTS, ('http', 'https'))
+
+
+def _safe_image_url(url) -> Optional[str]:
+    return _safe_url(url, _ALLOWED_IMAGE_HOSTS, ('https',))
+
+
+def _safe_stream_url(url) -> Optional[str]:
+    """Stream URL that may be passed to ffmpeg (https on SoundCloud delivery hosts only)."""
+    return _safe_url(url, _ALLOWED_STREAM_HOSTS, ('https',))
+
+
+def _clean(value, maxlen: int = 300) -> str:
+    """Strip terminal control sequences (colours, cursor movement, title changes, etc.) from external strings such as track titles."""
+    text = '' if value is None else str(value)
+    text = _ANSI_RE.sub('', text)
+    text = _CTRL_RE.sub(' ', text)
+    return text.strip()[:maxlen]
+
+
+def _as_int(v, default, lo=None, hi=None) -> int:
+    try:
+        if isinstance(v, bool):
+            raise ValueError
+        n = int(v)
+    except (TypeError, ValueError):
+        n = default
+    if lo is not None:
+        n = max(lo, n)
+    if hi is not None:
+        n = min(hi, n)
+    return n
+
+
+def _fetch_limited(url, allowed_hosts, *, params=None, headers=None, timeout=12,
+                   max_bytes=_MAX_JSON_BYTES, content_type=None):
+    """Fetch only https URLs on allowed hosts. Each redirect is validated, and
+    the download is cut off once the size limit is exceeded. Returns: (HTTP status, body bytes or None).
+    Status 0 means "refused before connecting / network error"."""
+    try:
+        import requests
+        cur = _safe_url(url, allowed_hosts, ('https',))
+        if not cur:
+            return 0, None
+        hdrs = {'User-Agent': SC_AGENT}
+        hdrs.update(headers or {})
+        cur_params = params
+        for _hop in range(4):
+            r = requests.get(cur, params=cur_params, headers=hdrs, timeout=timeout,
+                             stream=True, allow_redirects=False)
+            if r.status_code in (301, 302, 303, 307, 308):
+                nxt = _safe_url(_urljoin(cur, r.headers.get('Location', '')),
+                                allowed_hosts, ('https',))
+                r.close()
+                if not nxt:
+                    return 0, None
+                cur, cur_params = nxt, None
+                continue
+            break
+        else:
+            return 0, None
+        try:
+            status = r.status_code
+            if status != 200:
+                return status, None
+            if content_type and not str(r.headers.get('Content-Type', '')).lower().startswith(content_type):
+                return status, None
+            buf = bytearray()
+            for chunk in r.iter_content(65536):
+                buf += chunk
+                if len(buf) > max_bytes:
+                    return status, None
+            return status, bytes(buf)
+        finally:
+            r.close()
+    except Exception:
+        return 0, None
+
+
+_PRIV_DIR = None
+
+
+def _private_dir() -> Path:
+    """A work folder only you can read and write. Used so fixed-name files are not left in the shared /tmp.
+    If a candidate is owned by someone else or is a symlink it is not used; a new private folder is made instead."""
+    global _PRIV_DIR
+    if _PRIV_DIR is not None:
+        return _PRIV_DIR
+    uid = os.getuid()
+    cands = []
+    xdg = os.environ.get('XDG_RUNTIME_DIR')
+    if xdg:
+        cands.append(Path(xdg) / 'qji')
+    cands.append(Path(tempfile.gettempdir()) / f'qji-{uid}')
+    for p in cands:
+        try:
+            p.mkdir(mode=0o700, exist_ok=True)
+            st = os.lstat(p)
+            if not _stat.S_ISDIR(st.st_mode) or st.st_uid != uid:
+                continue
+            if st.st_mode & 0o077:
+                os.chmod(p, 0o700)
+            _PRIV_DIR = p
+            return p
+        except OSError:
+            continue
+    _PRIV_DIR = Path(tempfile.mkdtemp(prefix='qji-'))
+    return _PRIV_DIR
+
+
+def _write_private(path, data) -> None:
+    """Create with mode 600, then replace (no window in which other users could read it while it is being written)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(data, str):
+        data = data.encode('utf-8')
+    tmp = path.with_name(f'.{path.name}.{os.getpid()}.tmp')
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
+    fd = os.open(str(tmp), flags, 0o600)
+    with os.fdopen(fd, 'wb') as f:
+        f.write(data)
+    os.replace(str(tmp), str(path))
+
+
+def _ensure_private_file(path) -> bool:
+    """Check that a file holding secrets (e.g. cookies) is safe to read.
+    Symlinks and files owned by other users are rejected; loose permissions are tightened to 600."""
+    try:
+        st = os.lstat(str(path))
+    except OSError:
+        return False
+    if not _stat.S_ISREG(st.st_mode):
+        print(f'  ⚠ {path} is not a regular file — not using it')
+        return False
+    if st.st_uid != os.getuid():
+        print(f'  ⚠ {path} is owned by another user — not using it')
+        return False
+    if st.st_mode & 0o077:
+        try:
+            os.chmod(str(path), 0o600)
+            print(f'  🔒 {path} permissions tightened to 600 (it holds cookies, so only you should be able to read it)')
+        except OSError:
+            print(f'  ⚠ {path} permissions could not be fixed; please run chmod 600 manually')
+            return False
+    return True
+
+
+def _sanitize_track(t) -> Optional[dict]:
+    """Validate track info that comes from outside (browser UI, saved files, etc.).
+    Returns None if the URL is not allowed. Strings lose control characters; numbers are clamped to a sane range."""
+    if not isinstance(t, dict):
+        return None
+    url = _safe_media_url(t.get('url', ''))
+    if not url:
+        return None
+    return {
+        'url': url,
+        'id': _clean(t.get('id', ''), 64),
+        'title': _clean(t.get('title', '')), 'artist': _clean(t.get('artist', '')),
+        'genre': _clean(t.get('genre', '')),
+        'cover_url': str(t.get('cover_url') or t.get('art') or '')[:500],
+        'duration': _as_int(t.get('duration', 0), 0, 0, 24 * 3600),
+        'likes': _as_int(t.get('likes', 0), 0, 0, 10**12),
+        'plays': _as_int(t.get('plays', 0), 0, 0, 10**12),
+    }
+
+
+REQUEST_PATH  = _private_dir() / 'qji_soundcloud_request.json'   # same private folder as the main module
+_MAX_POST_BYTES = 2 * 1024 * 1024
+_MAX_TRACKS     = 500
+
 _client_id_cache: Optional[str] = None
 _server        = None
 _server_thread = None
@@ -61,14 +281,14 @@ def _load_config() -> dict:
         return {}
 
 
-def _get_client_id() -> Optional[str]:
+def _get_client_id(force_refresh: bool = False) -> Optional[str]:
     global _client_id_cache
-    if _client_id_cache:
+    if _client_id_cache and not force_refresh:
         return _client_id_cache
     cfg = _load_config()
     cid = cfg.get('client_id', '')
     age = (time.time() - cfg.get('client_id_fetched_at', 0)) / 3600
-    if cid and age < 24:
+    if cid and age < 24 and not force_refresh:
         _client_id_cache = cid
         return cid
     # 再抽出
@@ -77,8 +297,7 @@ def _get_client_id() -> Optional[str]:
         cfg['client_id'] = new_cid
         cfg['client_id_fetched_at'] = time.time()
         try:
-            CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-            CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2))
+            _write_private(CONFIG_PATH, json.dumps(cfg, ensure_ascii=False, indent=2))
         except Exception:
             pass
         _client_id_cache = new_cid
@@ -90,29 +309,29 @@ def _get_client_id() -> Optional[str]:
 
 
 def _extract_client_id() -> Optional[str]:
-    try:
-        import requests
-        r = requests.get('https://soundcloud.com',
-                         headers={'User-Agent': SC_AGENT}, timeout=15)
-        scripts = re.findall(
-            r'<script[^>]+src="(https://a-v2\.sndcdn\.com/assets/[^"]+\.js)"',
-            r.text)
-        for url in reversed(scripts[-8:]):
-            try:
-                sr = requests.get(url, headers={'User-Agent': SC_AGENT}, timeout=10)
-                for pat in [
-                    r'client_id:"([a-zA-Z0-9]{32})"',
-                    r'client_id,"([a-zA-Z0-9]{32})"',
-                    r'"client_id":"([a-zA-Z0-9]{32})"',
-                    r'clientId:"([a-zA-Z0-9]{32})"',
-                ]:
-                    m = re.search(pat, sr.text)
-                    if m:
-                        return m.group(1)
-            except Exception:
-                continue
-    except Exception:
-        pass
+    """Fetches only from https on soundcloud.com and sndcdn.com (redirects validated, size-capped)."""
+    status, body = _fetch_limited('https://soundcloud.com', ('soundcloud.com',),
+                                  timeout=15, max_bytes=_MAX_SCRIPT_BYTES)
+    if not body:
+        return None
+    scripts = re.findall(
+        r'<script[^>]+src="(https://a-v2\.sndcdn\.com/assets/[^"]+\.js)"',
+        body.decode('utf-8', errors='replace'))
+    for url in reversed(scripts[-8:]):
+        st, js = _fetch_limited(url, _ALLOWED_SCRIPT_HOSTS,
+                                timeout=10, max_bytes=_MAX_SCRIPT_BYTES)
+        if not js:
+            continue
+        text = js.decode('utf-8', errors='replace')
+        for pat in [
+            r'client_id:"([a-zA-Z0-9]{32})"',
+            r'client_id,"([a-zA-Z0-9]{32})"',
+            r'"client_id":"([a-zA-Z0-9]{32})"',
+            r'clientId:"([a-zA-Z0-9]{32})"',
+        ]:
+            m = re.search(pat, text)
+            if m:
+                return m.group(1)
     return None
 
 
@@ -124,14 +343,16 @@ def _sc_get(endpoint: str, params: dict) -> Optional[dict]:
     cid = _get_client_id()
     if not cid:
         return None
-    try:
-        import requests
-        p = {'client_id': cid, **params}
-        r = requests.get(f'{SC_API_BASE}{endpoint}',
-                         params=p, headers={'User-Agent': SC_AGENT}, timeout=12)
-        return r.json() if r.status_code == 200 else None
-    except Exception:
+    p = {'client_id': cid, **params}
+    status, body = _fetch_limited(f'{SC_API_BASE}{endpoint}', _ALLOWED_API_HOSTS,
+                                  params=p, timeout=12, max_bytes=_MAX_JSON_BYTES)
+    if status != 200 or not body:
         return None
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def _normalize_art(url: Optional[str]) -> str:
@@ -142,12 +363,14 @@ def _normalize_art(url: Optional[str]) -> str:
 
 
 def _dur_str(sec: int) -> str:
+    sec = _as_int(sec, 0, 0, 24 * 3600)
     if not sec:
         return ''
-    return f'{int(sec) // 60}:{int(sec) % 60:02d}'
+    return f'{sec // 60}:{sec % 60:02d}'
 
 
 def _num_fmt(n: int) -> str:
+    n = _as_int(n, 0, 0)
     if n >= 1_000_000:
         return f'{n / 1_000_000:.1f}M'
     if n >= 1_000:
@@ -155,25 +378,33 @@ def _num_fmt(n: int) -> str:
     return str(n)
 
 
+def _item_from_api(t: dict) -> Optional[dict]:
+    if not isinstance(t, dict):
+        return None
+    url = _safe_media_url(t.get('permalink_url', ''))
+    if not url:
+        return None
+    user = t.get('user') if isinstance(t.get('user'), dict) else {}
+    return {
+        'url':      url,
+        'id':       _clean(t.get('id', ''), 64),
+        'title':    _clean(t.get('title', '')),
+        'artist':   _clean(user.get('username', '')),
+        'art':      _normalize_art(t.get('artwork_url') or user.get('avatar_url'))[:500],
+        'duration': _as_int(t.get('duration') or 0, 0, 0, 10**9) // 1000,
+        'genre':    _clean(t.get('genre', '')),
+        'likes':    _as_int(t.get('likes_count', 0), 0, 0, 10**12),
+        'plays':    _as_int(t.get('playback_count', 0), 0, 0, 10**12),
+    }
+
+
 def search_tracks(query: str, limit: int = 24, offset: int = 0) -> dict:
     d = _sc_get('/search/tracks', {'q': query, 'limit': limit, 'offset': offset})
     if not d:
         return {'items': [], 'total': 0}
-    items = []
-    for t in d.get('collection', []):
-        user = t.get('user') or {}
-        items.append({
-            'url':      t.get('permalink_url', ''),
-            'id':       str(t.get('id', '')),
-            'title':    t.get('title', ''),
-            'artist':   user.get('username', ''),
-            'art':      _normalize_art(t.get('artwork_url') or user.get('avatar_url')),
-            'duration': int((t.get('duration') or 0) // 1000),
-            'genre':    t.get('genre', ''),
-            'likes':    t.get('likes_count', 0),
-            'plays':    t.get('playback_count', 0),
-        })
-    return {'items': items, 'total': d.get('total_results', len(items))}
+    coll = d.get('collection', [])
+    items = [x for x in (_item_from_api(t) for t in (coll if isinstance(coll, list) else [])) if x]
+    return {'items': items, 'total': _as_int(d.get('total_results'), len(items), 0, 10**7)}
 
 
 def search_playlists(query: str, limit: int = 16, offset: int = 0) -> dict:
@@ -181,26 +412,92 @@ def search_playlists(query: str, limit: int = 16, offset: int = 0) -> dict:
     if not d:
         return {'items': [], 'total': 0}
     items = []
-    for p in d.get('collection', []):
-        user = p.get('user') or {}
+    coll = d.get('collection', [])
+    for p in (coll if isinstance(coll, list) else []):
+        if not isinstance(p, dict):
+            continue
+        url = _safe_media_url(p.get('permalink_url', ''))
+        if not url:
+            continue
+        user = p.get('user') if isinstance(p.get('user'), dict) else {}
         items.append({
-            'url':         p.get('permalink_url', ''),
-            'id':          str(p.get('id', '')),
-            'title':       p.get('title', ''),
-            'artist':      user.get('username', ''),
-            'art':         _normalize_art(p.get('artwork_url')),
-            'track_count': p.get('track_count', 0),
-            'duration':    int((p.get('duration') or 0) // 1000),
-            'is_album':    p.get('is_album', False),
+            'url':         url,
+            'id':          _clean(p.get('id', ''), 64),
+            'title':       _clean(p.get('title', '')),
+            'artist':      _clean(user.get('username', '')),
+            'art':         _normalize_art(p.get('artwork_url'))[:500],
+            'track_count': _as_int(p.get('track_count', 0), 0, 0, 100000),
+            'duration':    _as_int(p.get('duration') or 0, 0, 0, 10**9) // 1000,
+            'is_album':    bool(p.get('is_album', False)),
         })
-    return {'items': items, 'total': d.get('total_results', len(items))}
+    return {'items': items, 'total': _as_int(d.get('total_results'), len(items), 0, 10**7)}
+
+
+def _sc_raw(endpoint: str, params: dict, cid: str):
+    """Call SoundCloud API v2 and return the JSON (dict or list) as is. None on failure."""
+    status, body = _fetch_limited(f'{SC_API_BASE}{endpoint}', _ALLOWED_API_HOSTS,
+                                  params={'client_id': cid, **params}, timeout=15,
+                                  max_bytes=_MAX_JSON_BYTES)
+    if status != 200 or not body:
+        return None
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return None
+    return data if isinstance(data, (dict, list)) else None
+
+
+def _playlist_via_api(playlist_url: str) -> Optional[List[dict]]:
+    """Fetch a playlist's tracks through the SoundCloud API (no yt-dlp needed).
+    /resolve (only the first few tracks have details, the rest are bare ids) → /tracks?ids= fills in the rest, 30 at a time.
+    Returns None for non-playlists or on failure (the caller falls back to yt-dlp)."""
+    for attempt in (0, 1):
+        cid = _get_client_id(force_refresh=(attempt == 1))
+        if not cid:
+            return None
+        data = _sc_raw('/resolve', {'url': playlist_url}, cid)
+        if isinstance(data, dict):
+            break
+    else:
+        return None
+    raw = data.get('tracks')
+    if not isinstance(raw, list) or not raw:
+        return None
+    raw = [t for t in raw[:_MAX_TRACKS] if isinstance(t, dict)]
+    full, need = {}, []
+    for t in raw:
+        if t.get('permalink_url') and t.get('title'):
+            full[t.get('id')] = t
+        elif isinstance(t.get('id'), int):
+            need.append(t['id'])
+    for k in range(0, len(need), 30):
+        res = _sc_raw('/tracks', {'ids': ','.join(str(i) for i in need[k:k + 30])}, cid)
+        for it in (res if isinstance(res, list) else []):
+            if isinstance(it, dict):
+                full[it.get('id')] = it
+    out = []
+    for t in raw:                       # keep the playlist's original order
+        it = full.get(t.get('id'))
+        x = _item_from_api(it) if it else None
+        if x:
+            out.append(x)
+    return out or None
 
 
 def get_playlist_detail(playlist_url: str) -> Optional[dict]:
-    """yt-dlp で プレイリスト詳細とトラックリストを取得する。"""
-    import subprocess
+    """Fetch playlist details and the track list.
+    ① SoundCloud API (primary) → ② yt-dlp (fallback)."""
+    playlist_url = _safe_media_url(playlist_url)
+    if not playlist_url:
+        return None
+    try:
+        via_api = _playlist_via_api(playlist_url)
+    except Exception:
+        via_api = None
+    if via_api:
+        return {'tracks': via_api, 'url': playlist_url}
     cmd = ['yt-dlp', '--flat-playlist', '--dump-json',
-           '--no-warnings', '--quiet', playlist_url]
+           '--no-warnings', '--quiet', '--', playlist_url]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         tracks = []
@@ -210,18 +507,25 @@ def get_playlist_detail(playlist_url: str) -> Optional[dict]:
                 continue
             try:
                 item = json.loads(line)
-                tracks.append({
-                    'url':      item.get('url', '') or item.get('webpage_url', ''),
-                    'id':       str(item.get('id', '')),
-                    'title':    item.get('title', ''),
-                    'artist':   item.get('uploader', item.get('channel', '')),
-                    'art':      _normalize_art(item.get('thumbnail', '')),
-                    'duration': int(item.get('duration') or 0),
-                    'genre':    item.get('genre', ''),
-                    'likes':    item.get('like_count', 0),
-                })
             except (json.JSONDecodeError, KeyError):
                 continue
+            if not isinstance(item, dict):
+                continue
+            t = _sanitize_track({
+                'url':      item.get('url', '') or item.get('webpage_url', ''),
+                'id':       item.get('id', ''),
+                'title':    item.get('title', ''),
+                'artist':   item.get('uploader', item.get('channel', '')),
+                'cover_url': _normalize_art(item.get('thumbnail', '')),
+                'duration': item.get('duration') or 0,
+                'genre':    item.get('genre', ''),
+                'likes':    item.get('like_count', 0),
+            })
+            if t:
+                t['art'] = t.pop('cover_url')
+                tracks.append(t)
+            if len(tracks) >= _MAX_TRACKS:
+                break
         return {'tracks': tracks, 'url': playlist_url} if tracks else None
     except Exception:
         return None
@@ -229,44 +533,103 @@ def get_playlist_detail(playlist_url: str) -> Optional[dict]:
 
 def load_favorites() -> List[dict]:
     try:
-        return json.loads(FAVS_PATH.read_text()) if FAVS_PATH.exists() else []
+        raw = json.loads(FAVS_PATH.read_text()) if FAVS_PATH.exists() else []
     except Exception:
         return []
+    out = []
+    for f in (raw if isinstance(raw, list) else []):
+        t = _sanitize_track(f)
+        if not t:
+            continue
+        t['no']             = _as_int(f.get('no', 0), 0, 0, 10**9)
+        t['saved_at']       = _clean(f.get('saved_at', ''), 32)
+        t['audio_settings'] = f.get('audio_settings') if isinstance(f.get('audio_settings'), dict) else {}
+        out.append(t)
+    return out
+
+
+def save_favorites(favs: List[dict]):
+    _write_private(FAVS_PATH, json.dumps(favs, ensure_ascii=False, indent=2))
 
 
 def load_playlists() -> List[dict]:
     try:
-        return json.loads(PLAYLISTS_PATH.read_text()) if PLAYLISTS_PATH.exists() else []
+        raw = json.loads(PLAYLISTS_PATH.read_text()) if PLAYLISTS_PATH.exists() else []
     except Exception:
         return []
+    out = []
+    for p in (raw if isinstance(raw, list) else []):
+        if not isinstance(p, dict):
+            continue
+        name = _clean(p.get('name', ''), 80)
+        if not name:
+            continue
+        rt = p.get('tracks') if isinstance(p.get('tracks'), list) else []
+        tracks = [x for x in (_sanitize_track(t) for t in rt[:2000]) if x]
+        out.append({
+            'no':       _as_int(p.get('no', 0), 0, 0, 10**9),
+            'name':     name,
+            'tracks':   tracks,
+            'count':    len(tracks),
+            'saved_at': _clean(p.get('saved_at', ''), 32),
+            'audio_settings': p.get('audio_settings') if isinstance(p.get('audio_settings'), dict) else {},
+        })
+    return out
 
 
 def save_playlists(pls: List[dict]):
-    from datetime import datetime
-    PLAYLISTS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    PLAYLISTS_PATH.write_text(json.dumps(pls, ensure_ascii=False, indent=2))
+    _write_private(PLAYLISTS_PATH, json.dumps(pls, ensure_ascii=False, indent=2))
 
 
-def fetch_cover(url: str) -> bytes:
-    if not url:
-        return b''
-    try:
-        import requests
-        r = requests.get(url, timeout=10, headers={'User-Agent': SC_AGENT})
-        return r.content if r.status_code == 200 else b''
-    except Exception:
-        return b''
+def fetch_cover(url: str):
+    """Fetch cover art. https on SoundCloud image hosts only.
+    Redirects are validated, size is capped at 8MB, non-images are refused. Returns: (bytes, content-type)."""
+    u = _safe_image_url(url)
+    if not u:
+        return b'', ''
+    status, body = _fetch_limited(u, _ALLOWED_IMAGE_HOSTS, timeout=10,
+                                  max_bytes=_MAX_IMAGE_BYTES, content_type='image/')
+    if status != 200 or not body:
+        return b'', ''
+    # Serve only formats recognisable as images (anything else is dropped, never passed off as jpeg)
+    head = body[:12]
+    if head.startswith(b'\xff\xd8\xff'):
+        return body, 'image/jpeg'
+    if head.startswith(b'\x89PNG\r\n\x1a\n'):
+        return body, 'image/png'
+    if head[:4] == b'RIFF' and head[8:12] == b'WEBP':
+        return body, 'image/webp'
+    if head[:6] in (b'GIF87a', b'GIF89a'):
+        return body, 'image/gif'
+    return b'', ''
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # HTML/CSS
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _esc(s: str) -> str:
-    return str(s).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
+def _esc(s) -> str:
+    """For text placed in HTML body text or in double-quoted attributes."""
+    return (str(s).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                  .replace('"', '&quot;').replace("'", '&#39;'))
 
-def _js(s: str) -> str:
-    return _esc(str(s)).replace("'", "&#39;")
+
+def _js(s) -> str:
+    """onclick="f('...')" , for values placed inside a single-quoted JavaScript string within an HTML attribute.
+    First escape it as a JavaScript string (\\ and \', newlines, etc.), then escape it as HTML.
+    Note: HTML escaping alone is not enough — when the browser decodes the attribute, the ' comes back and breaks out of the string."""
+    s = (str(s).replace('\\', '\\\\').replace("'", "\\'").replace('"', '\\x22')
+               .replace('\n', '\\n').replace('\r', '\\r')
+               .replace('\u2028', '\\u2028').replace('\u2029', '\\u2029')
+               .replace('<', '\\x3c').replace('>', '\\x3e').replace('&', '\\x26'))
+    return _esc(s)
+
+
+def _json_script(obj) -> str:
+    """<script type="application/json"> is where this JSON goes. Keeps </script> and the like from breaking out."""
+    return (json.dumps(obj, ensure_ascii=False)
+            .replace('<', '\\u003c').replace('>', '\\u003e').replace('&', '\\u0026')
+            .replace('\u2028', '\\u2028').replace('\u2029', '\\u2029'))
 
 
 CSS = """
@@ -731,11 +1094,11 @@ def page_search_tracks(query: str, page: int = 1) -> str:
     pages_html = _paginator(query, page, total, PAGE_SIZE, 'tracks')
 
     # 全曲再生用 JSON
-    all_tracks_json = json.dumps([
+    all_tracks_json = _js(json.dumps([
         {'url': t['url'], 'title': t['title'], 'artist': t['artist'],
          'cover_url': t['art'], 'duration': t['duration'], 'genre': t['genre']}
         for t in items
-    ], ensure_ascii=False).replace("'", "&#39;").replace('"', '&quot;')
+    ], ensure_ascii=False))
 
     toolbar = (
         f'<div style="display:flex;align-items:center;gap:8px;'
@@ -819,7 +1182,7 @@ def page_playlist(playlist_url: str) -> str:
 
     tracks = detail['tracks']
     total_dur = sum(t.get('duration', 0) for t in tracks)
-    playlist_name = playlist_url.rstrip('/').split('/')[-1].replace('-', ' ').title()
+    playlist_name = _clean(_urlparse(playlist_url).path.rstrip('/').split('/')[-1].replace('-', ' ').title(), 80)
 
     # 先頭のアートワーク
     first_art = next((t['art'] for t in tracks if t.get('art')), '')
@@ -827,11 +1190,11 @@ def page_playlist(playlist_url: str) -> str:
                 if first_art else '<div class="ni2">📋</div>')
 
     # 全トラックを JSON に変換してボタンへ埋め込む
-    tracks_json_html = json.dumps([
+    tracks_json_html = _js(json.dumps([
         {'url': t['url'], 'title': t['title'], 'artist': t['artist'],
          'cover_url': t['art'], 'duration': t['duration'], 'genre': t['genre']}
         for t in tracks
-    ], ensure_ascii=False).replace("'", "&#39;").replace('"', '&quot;')
+    ], ensure_ascii=False))
 
     rows = []
     for i, t in enumerate(tracks, 1):
@@ -876,7 +1239,7 @@ def page_playlist(playlist_url: str) -> str:
     )
 
     body = f"""<div class="pp">
-<a class="pm" href="javascript:history.back()" style="display:inline-flex;align-items:center;
+<a class="pm" href="/search" onclick="history.back();return false" style="display:inline-flex;align-items:center;
 gap:4px;padding:5px 12px;background:var(--hover);border:1px solid var(--border);
 border-radius:7px;color:var(--muted);text-decoration:none;font-size:.78rem;margin-bottom:14px">
 ← Back</a>
@@ -890,7 +1253,7 @@ border-radius:7px;color:var(--muted);text-decoration:none;font-size:.78rem;margi
       ▶ Play all
     </button>
     <button class="ptag" style="background:var(--hover);border:1px solid var(--border);"
-      onclick="savePlaylistDialog('{tracks_json_html}', '{playlist_name}')">
+      onclick="savePlaylistDialog('{tracks_json_html}', '{_js(playlist_name)}')">
       💾 Save playlist
     </button>
     <a class="pback" href="{_esc(playlist_url)}" target="_blank" rel="noopener">
@@ -928,14 +1291,11 @@ def page_favorites() -> str:
         gp_lbl  = (f'🔊{gp_db:+.1f}dB' if gp_db is not None else '')
         # 出力音量
         vol     = audio.get('volume')
-        vol_lbl = (f'Vol:{vol}dB' if vol is not None else '')
+        vol_lbl = (f'Vol:{_as_int(vol, 0, -20, 30)}dB' if isinstance(vol, (int, float)) and not isinstance(vol, bool) else '')
         parts   = [x for x in [fp_lbl, gp_lbl, vol_lbl] if x]
         preset_display = '  '.join(parts)
         # audio_settingsをJSON文字列としてJSに渡す
-        audio_json = json.dumps(audio, ensure_ascii=False)\
-                         .replace('\\', '\\\\')\
-                         .replace("'", "&#39;")\
-                         .replace('"', '&quot;')
+        audio_json = _js(json.dumps(audio, ensure_ascii=False))
         # チェックボックス（キュー追加用）
         cb_html = (
             f'<input type="checkbox" class="sel-cb"'
@@ -970,12 +1330,12 @@ def page_favorites() -> str:
         )
 
     # 全曲再生用 JSON（<script type="application/json"> タグに埋め込む）
-    favs_json_str = json.dumps([
+    favs_json_str = _json_script([
         {'url': f['url'], 'title': f['title'], 'artist': f['artist'],
          'cover_url': f.get('cover_url', ''), 'duration': f.get('duration', 0),
          'genre': f.get('genre', '')}
         for f in favs
-    ], ensure_ascii=False)
+    ])
 
     toolbar = (
         f'<div style="display:flex;align-items:center;gap:8px;'
@@ -1026,13 +1386,13 @@ def page_my_playlists() -> str:
         first_art = next((t.get('cover_url', t.get('art', '')) for t in tracks if t.get('cover_url') or t.get('art')), '')
         art_html = (f'<img class="fav-art" src="/cover?url={quote(first_art)}" loading="lazy" alt="">'
                     if first_art else '<div class="fav-ni">📁</div>')
-        saved = p.get('saved_at', '')[:10]
+        saved = _esc(p.get('saved_at', '')[:10])
         # tracks JSON for play button
-        tracks_json = json.dumps([
+        tracks_json = _js(json.dumps([
             {'url': t.get('url',''), 'title': t.get('title',''), 'artist': t.get('artist',''),
              'cover_url': t.get('cover_url', t.get('art','')), 'duration': t.get('duration',0), 'genre': t.get('genre','')}
             for t in tracks
-        ], ensure_ascii=False).replace("'", "&#39;").replace('"', '&quot;')
+        ], ensure_ascii=False))
         no = p.get('no', 0)
         del_btn = (
             f'<button class="fav-del" title="Remove"'
@@ -1068,7 +1428,7 @@ def _paginator(query: str, page: int, total: int,
         return ''
 
     def link(p: int, label: str) -> str:
-        return (f'<a href="/search?q={quote(query)}&tab={tab}&page={p}">{label}</a>')
+        return (f'<a href="/search?q={quote(query)}&amp;tab={_esc(tab)}&amp;page={int(p)}">{label}</a>')
 
     parts = []
     if page > 1:
@@ -1092,15 +1452,57 @@ def _paginator(query: str, page: int, total: int,
 # HTTP ハンドラ
 # ═══════════════════════════════════════════════════════════════════════════
 
+# Make the browser enforce "this page talks to nothing but itself (127.0.0.1)" — defence in depth in case anything ever slips into the page
+_CSP = ("default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+        "img-src 'self' data:; connect-src 'self'; form-action 'self'; "
+        "base-uri 'none'; frame-ancestors 'none'; object-src 'none'")
+
+
 class Handler(BaseHTTPRequestHandler):
+    timeout = 15          # a stalled connection must not hog the whole server
+    server_version = 'QjiSC'
+    sys_version = ''
+
     def log_message(self, fmt, *args):
         pass  # アクセスログを抑制
+
+    # ── Is this request acceptable? ─────────────────────────────────────
+    def _allowed_origins(self):
+        port = self.server.server_address[1]
+        return {f'http://127.0.0.1:{port}', f'http://localhost:{port}', f'http://[::1]:{port}'}
+
+    def _guard(self, post: bool) -> bool:
+        """Check Host (against DNS rebinding) and Sec-Fetch-Site / Origin (against actions triggered from other sites)."""
+        port = self.server.server_address[1]
+        host = (self.headers.get('Host') or '').lower()
+        if host not in {f'127.0.0.1:{port}', f'localhost:{port}', f'[::1]:{port}'}:
+            self._send('<p>Forbidden</p>', code=403); return False
+        site = (self.headers.get('Sec-Fetch-Site') or '').lower()
+        if site and site not in ('same-origin', 'none'):
+            self._send('<p>Forbidden</p>', code=403); return False
+        if post:
+            origin = self.headers.get('Origin')
+            if origin is not None and origin not in self._allowed_origins():
+                self._json({'ok': False, 'error': 'forbidden'}, 403); return False
+            ctype = (self.headers.get('Content-Type') or '').split(';')[0].strip().lower()
+            if ctype != 'application/json':
+                self._json({'ok': False, 'error': 'unsupported media type'}, 415); return False
+        return True
+
+    def _common_headers(self):
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('Referrer-Policy', 'no-referrer')
+        self.send_header('X-Frame-Options', 'DENY')
+        self.send_header('Cross-Origin-Resource-Policy', 'same-origin')
 
     def _send(self, html: str, code: int = 200):
         data = html.encode('utf-8')
         self.send_response(code)
         self.send_header('Content-Type', 'text/html; charset=utf-8')
         self.send_header('Content-Length', len(data))
+        self.send_header('Content-Security-Policy', _CSP)
+        self.send_header('Cache-Control', 'no-store')
+        self._common_headers()
         self.end_headers()
         try:
             self.wfile.write(data)
@@ -1112,19 +1514,23 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', len(data))
+        self.send_header('Cache-Control', 'no-store')
+        self._common_headers()
         self.end_headers()
         try:
             self.wfile.write(data)
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-    def _img(self, data: bytes):
+    def _img(self, data: bytes, ctype: str = 'image/jpeg'):
         if not data:
-            self.send_response(204); self.end_headers(); return
+            self.send_response(204); self._common_headers(); self.end_headers(); return
         self.send_response(200)
-        self.send_header('Content-Type', 'image/jpeg')
+        self.send_header('Content-Type', ctype)
         self.send_header('Content-Length', len(data))
         self.send_header('Cache-Control', 'max-age=3600')
+        self.send_header('Content-Security-Policy', "default-src 'none'; sandbox")
+        self._common_headers()
         self.end_headers()
         try:
             self.wfile.write(data)
@@ -1132,17 +1538,19 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def do_GET(self):
+        if not self._guard(post=False):
+            return
         pars = urlparse(self.path)
-        qs   = parse_qs(pars.query)
-        def q(k, d=''): return unquote(qs.get(k, [''])[0]) or d
+        qs   = parse_qs(pars.query)          # parse_qs already decodes once (never decode twice)
+        def q(k, d=''): return qs.get(k, [''])[0] or d
         def qi(k, d=1):
             try: return int(qs.get(k, [''])[0])
-            except: return d
+            except (ValueError, TypeError): return d
         path = pars.path
 
         if path in ('/', '/search'):
-            query = q('q')
-            page  = qi('page', 1)
+            query = _clean(q('q'), 200)
+            page  = max(1, min(qi('page', 1), 1000))
             tab   = q('tab', 'tracks')
             if tab == 'playlists':
                 self._send(page_search_playlists(query, page))
@@ -1159,7 +1567,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(page_my_playlists())
 
         elif path == '/cover':
-            self._img(fetch_cover(q('url')))
+            data, ctype = fetch_cover(q('url'))
+            self._img(data, ctype or 'image/jpeg')
 
         elif path == '/api/status':
             closed = _CLOSE_SIGNAL.is_set()
@@ -1169,62 +1578,68 @@ class Handler(BaseHTTPRequestHandler):
             self._send('<p>Not Found</p>', code=404)
 
     def do_POST(self):
+        if not self._guard(post=True):
+            return
         pars = urlparse(self.path)
         path = pars.path
         try:
             length = int(self.headers.get('Content-Length', 0))
-            body   = json.loads(self.rfile.read(length)) if length else {}
+        except ValueError:
+            length = 0
+        if length < 0 or length > _MAX_POST_BYTES:
+            self._json({'ok': False, 'error': 'too large'}, 413)
+            return
+        try:
+            body = json.loads(self.rfile.read(length)) if length else {}
         except Exception:
+            body = {}
+        if not isinstance(body, dict):
             body = {}
 
         if path == '/play':
             req_type = body.get('type', 'track')
 
             if req_type == 'playlist':
-                tracks = body.get('tracks', [])
+                raw = body.get('tracks', [])
+                tracks = [x for x in (_sanitize_track(t) for t in (raw if isinstance(raw, list) else [])[:_MAX_TRACKS]) if x]
                 if not tracks:
-                    self._json({'ok': False, 'error': 'tracks are empty'}, 400)
+                    self._json({'ok': False, 'error': 'tracks are empty (or the URLs are unsupported)'}, 400)
                     return
                 req = {
                     'type':         'playlist',
                     'tracks':       tracks,
-                    'start_from':   body.get('start_from', 1),
+                    'start_from':   _as_int(body.get('start_from', 1), 1, 1, len(tracks)),
                     'requested_at': time.time(),
                 }
                 try:
-                    REQUEST_PATH.write_text(json.dumps(req, ensure_ascii=False))
+                    _write_private(REQUEST_PATH, json.dumps(req, ensure_ascii=False))
                     print(f'\n  📋 Playlist play request: {len(tracks)} tracks')
                     self._json({'ok': True})
-                except Exception as e:
-                    self._json({'ok': False, 'error': str(e)}, 500)
+                except Exception:
+                    self._json({'ok': False, 'error': 'could not save the play request'}, 500)
 
             else:
-                url = body.get('url', '')
-                if not url:
-                    self._json({'ok': False, 'error': 'URL required'}, 400)
+                track = _sanitize_track(body)
+                if not track:
+                    self._json({'ok': False, 'error': 'a supported SoundCloud URL is required'}, 400)
                     return
+                audio = body.get('audio_settings', {})
                 req = {
                     'type':           'track',
-                    'url':            url,
-                    'title':          body.get('title', ''),
-                    'artist':         body.get('artist', ''),
-                    'cover_url':      body.get('cover_url', ''),
-                    'duration':       body.get('duration', 0),
-                    'genre':          body.get('genre', ''),
-                    'audio_settings': body.get('audio_settings', {}),  # gain_preset/volume含む
+                    **track,
+                    'audio_settings': audio if isinstance(audio, dict) else {},  # the main module applies only the allowed items
                     'requested_at':   time.time(),
                 }
                 try:
-                    REQUEST_PATH.write_text(json.dumps(req, ensure_ascii=False))
-                    title = req['title'] or url
-                    print(f'\n  📱 Browser play: {req["artist"]} — {title}')
+                    _write_private(REQUEST_PATH, json.dumps(req, ensure_ascii=False))
+                    print(f'\n  📱 Browser play: {track["artist"]} — {track["title"] or track["url"]}')
                     self._json({'ok': True})
-                except Exception as e:
-                    self._json({'ok': False, 'error': str(e)}, 500)
+                except Exception:
+                    self._json({'ok': False, 'error': 'could not save the play request'}, 500)
 
         elif path == '/api/delete_favorite':
             url = body.get('url', '')
-            if not url:
+            if not isinstance(url, str) or not url:
                 self._json({'ok': False, 'error': 'URL required'}, 400)
                 return
             try:
@@ -1233,21 +1648,21 @@ class Handler(BaseHTTPRequestHandler):
                 if len(new_favs) == len(favs):
                     self._json({'ok': False, 'error': 'not found'}, 404)
                     return
-                FAVS_PATH.write_text(
-                    json.dumps(new_favs, ensure_ascii=False, indent=2))
-                print(f'\n  🗑 Favourite removed: {url[:60]}')
+                save_favorites(new_favs)
+                print(f'\n  🗑 Favourite removed: {_clean(url, 60)}')
                 self._json({'ok': True})
-            except Exception as e:
-                self._json({'ok': False, 'error': str(e)}, 500)
+            except Exception:
+                self._json({'ok': False, 'error': 'could not delete'}, 500)
 
         elif path == '/api/save_playlist':
-            name   = body.get('name', '').strip()
-            tracks = body.get('tracks', [])
+            name = _clean(body.get('name', ''), 80) if isinstance(body.get('name', ''), str) else ''
+            raw  = body.get('tracks', [])
+            tracks = [x for x in (_sanitize_track(t) for t in (raw if isinstance(raw, list) else [])[:_MAX_TRACKS]) if x]
             if not name:
                 self._json({'ok': False, 'error': 'playlist name required'}, 400)
                 return
             if not tracks:
-                self._json({'ok': False, 'error': 'tracks are empty'}, 400)
+                self._json({'ok': False, 'error': 'tracks are empty (or the URLs are unsupported)'}, 400)
                 return
             try:
                 from datetime import datetime
@@ -1273,12 +1688,12 @@ class Handler(BaseHTTPRequestHandler):
                 save_playlists(pls)
                 print(f'\n  💾 Playlist {action} saved: "{name}" ({len(tracks)} tracks)')
                 self._json({'ok': True, 'no': next_no})
-            except Exception as e:
-                self._json({'ok': False, 'error': str(e)}, 500)
+            except Exception:
+                self._json({'ok': False, 'error': 'could not save'}, 500)
 
         elif path == '/api/delete_playlist':
             no = body.get('no')
-            if no is None:
+            if isinstance(no, bool) or not isinstance(no, int):
                 self._json({'ok': False, 'error': 'no required'}, 400)
                 return
             try:
@@ -1291,8 +1706,8 @@ class Handler(BaseHTTPRequestHandler):
                 save_playlists(pls)
                 print(f'\n  🗑 Playlist deleted: "{target["name"]}"')
                 self._json({'ok': True})
-            except Exception as e:
-                self._json({'ok': False, 'error': str(e)}, 500)
+            except Exception:
+                self._json({'ok': False, 'error': 'could not delete'}, 500)
 
         else:
             self._send('<p>Not Found</p>', code=404)
@@ -1307,15 +1722,15 @@ def start_browser_server(port: int = PORT, open_browser: bool = True) -> bool:
     if _server:
         return True
     try:
-        _server = HTTPServer(('0.0.0.0', port), Handler)
+        _server = HTTPServer((BIND_HOST, port), Handler)   # 127.0.0.1 only (not reachable from the LAN)
         _server_thread = threading.Thread(
             target=_server.serve_forever, daemon=True)
         _server_thread.start()
-        print(f'  🌐 SoundCloud browser UI: http://localhost:{port}')
+        print(f'  🌐 SoundCloud browser UI: http://{BIND_HOST}:{port}')
         if open_browser:
             time.sleep(0.3)
             try:
-                subprocess.Popen(['xdg-open', f'http://localhost:{port}'],
+                subprocess.Popen(['xdg-open', f'http://{BIND_HOST}:{port}'],
                                  stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL)
             except Exception:
@@ -1342,16 +1757,25 @@ def send_close_signal():
 
 
 def check_browser_request() -> Optional[dict]:
-    if not REQUEST_PATH.exists():
+    """Receive a "play request" passed from the browser UI to the main module.
+    Reads only a regular file owned by you in your private folder (size-capped)."""
+    try:
+        st = os.lstat(str(REQUEST_PATH))
+    except OSError:
         return None
     try:
-        req = json.loads(REQUEST_PATH.read_text())
-        if time.time() - req.get('requested_at', 0) > 10:
+        if (not _stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid()
+                or st.st_size > _MAX_POST_BYTES):
             REQUEST_PATH.unlink(missing_ok=True)
             return None
+        req = json.loads(REQUEST_PATH.read_text())
         REQUEST_PATH.unlink(missing_ok=True)
+        if not isinstance(req, dict) or time.time() - _as_int(req.get('requested_at', 0), 0) > 10:
+            return None
         return req
     except Exception:
+        try: REQUEST_PATH.unlink(missing_ok=True)
+        except Exception: pass
         return None
 
 
