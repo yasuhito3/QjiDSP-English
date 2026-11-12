@@ -1,0 +1,174 @@
+devices:
+  samplerate: 48000
+  chunksize: 4096   # enlarged to 4096 to leave CPU headroom (about 85 ms latency, unnoticeable for music listening). Same as v1-v6
+  capture:
+    type: Alsa
+    channels: 2
+    device: "hw:CARD=Loopback,DEV=1"
+    format: S32_LE
+  playback:
+    type: Alsa
+    channels: 2
+    device: "plughw:CARD=Amanero,DEV=0"
+    format: S32_LE
+
+filters:
+  real_hall_L:
+    type: Conv
+    parameters:
+      type: Wav
+      filename: "{HOME}/camilladsp_test/Musikvereinsaal_48k_tail.wav"
+      channel: 0
+  real_hall_R:
+    type: Conv
+    parameters:
+      type: Wav
+      filename: "{HOME}/camilladsp_test/Musikvereinsaal_48k_tail.wav"
+      channel: 1
+  wet_gain_L:
+    type: Gain
+    parameters:
+      gain: -36.53
+      scale: dB
+  wet_gain_R:
+    type: Gain
+    parameters:
+      gain: -36.53
+      scale: dB
+  # ★ Entry point for wobble / volume-link: wobble_v7.py moves the Aux1 (L) / Aux2 (R) faders.
+  #   At 0 dB it is a pass-through (the sound does not change even if the wobble is not running). limit is the runaway-prevention cap (+6 dB).
+  wet_fader_L:
+    type: Volume
+    parameters:
+      fader: Aux1
+      ramp_time: 250
+      limit: 6.0
+  wet_fader_R:
+    type: Volume
+    parameters:
+      fader: Aux2
+      ramp_time: 250
+      limit: 6.0
+  delay_R:
+    type: Delay
+    parameters:
+      delay: 35
+      unit: ms
+      subsample: false
+
+  low_bass_harmonic:
+    type: Biquad
+    parameters:
+      type: Peaking
+      freq: 100
+      q: 1.5
+      gain: 0.8
+      
+  mid_high_resonance:
+    type: Biquad
+    parameters:
+      type: Peaking
+      freq: 2500     # upper mids where wind instruments such as the shakuhachi resonate easily
+      q: 8.0        # Q set to a very sharp 8.0 (pinpoint)
+      gain: 1.5      # because the peak is so narrow, even 1.5 dB readily adds a ringing resonance
+
+  violin_resonance_1:
+    type: Biquad
+    parameters:
+      type: Peaking
+      freq: 2500
+      q: 12.0       # extremely sharp (does not drag in unwanted fizz)
+      gain: 2
+  violin_resonance_2:
+    type: Biquad
+    parameters:
+      type: Peaking
+      freq: 3500
+      q: 15.0
+      gain: 1.5
+  violin_resonance_3:
+    type: Biquad
+    parameters:
+      type: Peaking
+      freq: 5000
+      q: 12.0
+      gain: 1
+
+  high_shelf:
+    type: Biquad
+    parameters:
+      type: Highshelf
+      freq: 6000
+      slope: 1.0
+      gain: -1.5
+  safety_limiter:
+    type: Limiter
+    parameters:
+      clip_limit: -0.5
+      soft_clip: true
+
+mixers:
+  split_2to4:
+    channels:
+      in: 2
+      out: 4
+    mapping:
+      - dest: 0
+        sources:
+          - channel: 0
+            gain: 0
+            inverted: false
+      - dest: 1
+        sources:
+          - channel: 1
+            gain: 0
+            inverted: false
+      - dest: 2
+        sources:
+          - channel: 0
+            gain: 0
+            inverted: false
+      - dest: 3
+        sources:
+          - channel: 1
+            gain: 0
+            inverted: false
+
+  mix_4to2:
+    channels:
+      in: 4
+      out: 2
+    mapping:
+      - dest: 0
+        sources:
+          - channel: 0
+            gain: 0
+            inverted: false
+          - channel: 2
+            gain: 0
+            inverted: false
+      - dest: 1
+        sources:
+          - channel: 1
+            gain: 0
+            inverted: false
+          - channel: 3
+            gain: 0
+            inverted: false
+
+pipeline:
+  - type: Mixer
+    name: split_2to4
+  - type: Filter
+    channels: [2]
+    names: [real_hall_L, wet_gain_L, wet_fader_L]
+  - type: Filter
+    channels: [3]
+    names: [real_hall_R, wet_gain_R, delay_R, wet_fader_R]
+  - type: Mixer
+    name: mix_4to2
+  - type: Filter
+    channels: [0, 1]
+    # mid_high_resonance is inserted just before high_shelf
+    #names: [low_bass_harmonic, mid_high_resonance, high_shelf, safety_limiter]
+    names: [low_bass_harmonic, mid_high_resonance, violin_resonance_1, violin_resonance_2, violin_resonance_3, high_shelf, safety_limiter]

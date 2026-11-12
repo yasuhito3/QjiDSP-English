@@ -1,6 +1,6 @@
 # Qji
 
-A hi-fi music playback system for Linux. In addition to local file playback, it integrates streaming from Qobuz, SoundCloud, and YouTube Music, 3D spatial audio extension via CamillaDSP (soundfields v1-v6), genre-adaptive EQ (Sonia Intelligence), and automatic distortion mitigation (Auto De-Clip).
+A hi-fi music playback system for Linux. In addition to local file playback, it integrates streaming from Qobuz, SoundCloud, and YouTube Music, 3D spatial audio extension via CamillaDSP (soundfields v1-v8 and sound-field presets), genre-adaptive EQ (Sonia Intelligence), automatic distortion mitigation (Auto De-Clip), and USB output digital-noise mitigation.
 
 > Developed and refined for daily use in a personal hi-fi setup (Mark Levinson amplifier, Amanero Combo384 USB DAC, etc.).
 
@@ -13,15 +13,20 @@ A hi-fi music playback system for Linux. In addition to local file playback, it 
 
 - **Local playback**: browse by album art, folder playback, search by composer / performer / conductor / genre / mood
 - **Streaming**: Qobuz (Hi-Res), SoundCloud (fetched directly through the SoundCloud API), YouTube Music (`yt-dlp` + `ytmusicapi`)
-- **3D spatial audio extension (QjiDSP)**: a DSP pipeline through a virtual sound card (ALSA Loopback) powered by CamillaDSP, with six soundfield presets:
+- **3D spatial audio extension (QjiDSP)**: a DSP pipeline through a virtual sound card (ALSA Loopback) powered by CamillaDSP, with eight soundfields:
   1. Rich hall (static) — full EQ chain, calm reverb
   2. Rich hall (dynamic) — full EQ chain, gentle airflow modulation
   3. Natural timbre (static) — simple, emphasizes presence and realism
   4. Natural timbre (dynamic) — simple, with subtle panning
   5. Harmonics mode — violin resonance and shakuhachi-style harmonic emphasis
   6. Harmonics mode (for headphones) — crossfeed processing optimized for headphone listening
+  7. Harmonic Hall mode — hall based on Harmonics mode (v5). Not muffled and easy to listen to, with wobble and volume-link
+  8. Tangible Hall — hall based on Harmonics mode (v5). Denser reverb with a strong sense of physical presence, with wobble and volume-link
+- **Sound-field presets (the `e` key during playback)**: adjust "violin beautifully", "vocal forward", "wider / closer", "wobble", "volume-link" and more on the spot, without stopping the music. Per-track / per-album memory is supported (local playback and Qobuz)
 - **Sonia Intelligence (SI)**: automatically adjusts EQ based on the genre currently playing
 - **Auto De-Clip**: detects distortion in real time via ffmpeg's astats/ametadata filters and auto-adjusts gain
+- **USB output digital-noise mitigation (USB-Noise-Guard)**: disables USB autosuspend and grants real-time priority. It is applied automatically at startup, and during playback the `u` / `k` / `j` / `m` keys let you toggle it for A/B listening (needs `usb_noise_guard.py`)
+- **Seamless cover art**: during folder playback and consecutive Qobuz playback, the cover-art screen is not closed between tracks, so the desktop never flashes into view
 - **Voice control (optional)**: offline Japanese speech recognition via Vosk
 - **AirPlay / UPnP receiver**: via shairport-sync / gmediarender
 - **Named presets**: save and recall volume, audio, and gain presets by name
@@ -78,7 +83,7 @@ The installer will:
 - Download CamillaDSP
 - Install `deno` (used to solve YouTube's signature challenges; **version 2.3 or later is required**)
 - Enable the virtual sound card (`snd-aloop`)
-- Place the full app + DSP config files (soundfields v1-v6) + IR (reverb) file into `~/qji/`
+- Place the full app + DSP config files (soundfields v1-v8) + sound-field presets + IR (reverb) file into `~/qji/`
 
 If you already have `~/qji/` installed, any file that gets overwritten is automatically backed up with a timestamp first.
 
@@ -92,7 +97,7 @@ To launch manually:
 cd ~/qji && python3 qji.py
 ```
 
-Selecting "Loopback" as the output device lets you choose from six soundfields (v1-v6). Selecting any other device gives you direct output, bypassing the DSP.
+Selecting "Loopback" as the output device lets you choose from eight soundfields (v1-v8). Selecting any other device gives you direct output, bypassing the DSP.
 
 ---
 
@@ -106,6 +111,43 @@ Once installed, you don't need to re-download the zip or `git clone` again each 
 This checks this repository's `VERSION` file, and if a newer version is available, downloads it (after confirmation) and re-runs `install_qjidsp.sh` with the latest files. Any existing files that get overwritten are automatically backed up with a timestamp, per the installer's usual behavior. If you're already on the latest version, it just says so and exits.
 
 This is the same approach used by Qji Peak Monitor's update checker.
+
+---
+
+## Soundfields v7 / v8 and sound-field presets (the `e` key)
+
+### Soundfields v7 / v8
+
+| Soundfield | Character |
+|---|---|
+| 7. Harmonic Hall mode | A hall based on Harmonics mode (v5). EQ-centred with modest reverb. Not muffled and easy to listen to |
+| 8. Tangible Hall | A hall based on Harmonics mode (v5). Dense reverb with a strong sense of physical presence |
+
+Both run a "wobble" that slowly moves the amount of hall reverb during playback, and a "volume-link" that adds reverb as the playback level rises (`wobble_v7.py` / `wobble_v8.py`). Switch between soundfields without stopping the music with the `1`-`8` keys during playback, or the `D` key on the home screen.
+
+### Sound-field presets (the `e` key during playback)
+
+Press `e`, then press the next key (within a few seconds, or it is cancelled).
+
+| Key | Meaning |
+|---|---|
+| `w` / `n` | Wider / closer sound field |
+| `o` | Vocal forward |
+| `f` / `l` | Wobble / volume-link ON/OFF (v7 and v8 only) |
+| `v` `u` `b` `c` `t` `h` `d` `p` `q` | Classical: violin / violin (moist) / oboe / clarinet / flute / horn & brass / cello & low strings / piano / string quartet |
+| `a` -> `1`-`8` | Vocal: soprano / alto & mezzo / tenor / baritone / bass / choir / female (jazz & pop) / male (jazz & pop) |
+| `j` / `s` | Jazz: bass (pizzicato) / sax |
+| `z` | Use / don't use the SI EQ |
+| `m` | Memory: `1` this track / `2` whole album to store, `3` `4` to clear |
+| `?` | Show the current settings |
+| `r` | Reset to default |
+
+- Pressing the same instrument key repeatedly cycles weak -> medium -> strong -> off.
+- `w` `n` `f` `l` take effect immediately. The instrument EQ takes effect from the next track or an `r` (reload).
+- Memories are stored in `~/qji_field_prefs.json`. Priority: track memory > album memory > automatic rules from the title etc. > default.
+- Default: with soundfield v7 or v8 and the Musikverein filter, "Violin, beautifully (weak)" is selected automatically. Wobble and volume-link are ON at startup.
+- Besides local playback, `e` (sound-field presets), `x` (SI acoustic presets) and `r` (restart the current track) also work during Qobuz playback.
+- The sound-field presets need `qji_field_ctl.py`. The installer places it in `~/qji/camilladsp_test/`.
 
 ---
 
@@ -194,6 +236,8 @@ cat /tmp/camilladsp.log /tmp/wobble.log /tmp/cdsp_watchdog.log
 
 If you see an error like `Invalid filter ... No such file or directory`, the IR (reverb) file's path was not expanded correctly. Check that the file exists under `~/qji/camilladsp_test/`.
 
+If switching to soundfield v7 / v8 says that required files were not found, check that `spatial_final.yml` exists in `~/qji/qjidsp_backup_v7/` (or `v8`), and that `wobble_v7.py` (or `wobble_v8.py`) and `qji_field_ctl.py` exist in `~/qji/camilladsp_test/`. Nothing is switched and playback simply continues. Re-running the installer (`install_qjidsp.sh`) places all of them.
+
 To test just the Loopback → DAC path on its own:
 
 ```bash
@@ -264,6 +308,8 @@ SoundCloud playback does not depend on `yt-dlp`, so an out-of-date `yt-dlp` norm
 ```
 ~/qji/
 ├── qji.py                      # main app
+├── usb_noise_guard.py          # USB output digital-noise mitigation
+├── install_usb_audio_optimize.sh  # one-time setup for USB-Noise-Guard (run once with sudo)
 ├── VERSION                     # installed version (read by update_qjidsp.sh)
 ├── update_qjidsp.sh            # update checker script (target of the Desktop icon)
 ├── qji_qobuzdsp.py             # Qobuz module
@@ -276,10 +322,12 @@ SoundCloud playback does not depend on `yt-dlp`, so an out-of-date `yt-dlp` norm
 │   ├── spatial_final.yml       # currently active DSP config (generated at startup)
 │   ├── wobble_v1-v5.py         # wobble LFO scripts
 │   ├── wobble_v5_harmonics_hp.py
+│   ├── wobble_v7.py / wobble_v8.py   # wobble / volume-link for v7 and v8
+│   ├── qji_field_ctl.py        # control for the sound-field presets (e key); shared by wobble_v7/v8 and the app
 │   ├── cdsp_watchdog.py        # CamillaDSP health monitor
 │   └── Musikvereinsaal_48k_tail.wav  # reverb IR file
-└── qjidsp_backup_v1-v6/
-    └── spatial_final.yml       # soundfield presets v1-v6 (templates)
+└── qjidsp_backup_v1-v8/
+    └── spatial_final.yml       # soundfields v1-v8 (templates)
 ```
 
 ---

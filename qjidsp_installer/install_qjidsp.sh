@@ -2,7 +2,7 @@
 # =============================================================
 #  QjiDSP Installer v2 (English)
 #  3D spatial audio extension for Qji, powered by CamillaDSP
-#  (six spatial soundfield presets, v1-v6)
+#  (eight spatial soundfields, v1-v8, plus sound-field presets)
 #  This installs the full Qji app + DSP files together into ~/qji/
 # =============================================================
 
@@ -45,7 +45,7 @@ banner() {
     echo -e "${CYAN}${BOLD}"
     echo "  ╔══════════════════════════════════════════╗"
     echo "  ║          🎛️  QjiDSP Installer             ║"
-    echo "  ║  3D Spatial Audio for Qji (presets v1-v6) ║"
+    echo "  ║  3D Spatial Audio for Qji (presets v1-v8) ║"
     echo "  ╚══════════════════════════════════════════╝"
     echo -e "${RESET}"
 }
@@ -78,7 +78,7 @@ echo "  2. Install/update Python libraries and yt-dlp[default] (required for You
 echo "  3. Install CamillaDSP"
 echo "  4. Install deno (used to stabilize YouTube Music playback)"
 echo "  5. Set up the virtual sound card (snd-aloop)"
-echo "  6. Place the full Qji app + DSP files (soundfields v1-v6) into ${QJI_DIR}/"
+echo "  6. Place the full Qji app + DSP files (soundfields v1-v8, sound-field presets) into ${QJI_DIR}/"
 echo "  7. Update existing files to the DSP-enabled version (old versions are auto-backed up)"
 echo "  8. Set up the USB output digital-noise mitigation (USB-Noise-Guard) (optional, needs root)"
 echo ""
@@ -259,7 +259,7 @@ fi
 step "Placing the Qji app + QjiDSP files (under ${QJI_DIR}/)"
 
 mkdir -p "$QJI_DIR/camilladsp_test"
-for v in 1 2 3 4 5 6; do
+for v in 1 2 3 4 5 6 7 8; do
     mkdir -p "$QJI_DIR/qjidsp_backup_v${v}"
 done
 
@@ -276,16 +276,39 @@ cp "$SCRIPT_DIR/wobble_v5_harmonics.py" "$QJI_DIR/camilladsp_test/wobble_v5_harm
 cp "$SCRIPT_DIR/cdsp_watchdog.py" "$QJI_DIR/camilladsp_test/cdsp_watchdog.py"
 ok "IR / wobble / watchdog files placed"
 
+# Soundfield v7 (Harmonic Hall mode) / v8 (Tangible Hall) and the sound-field presets (the [e] key during playback).
+#   wobble_v7.py / wobble_v8.py import qji_field_ctl.py from "their own folder" for the
+#   wobble and volume-link, so qji_field_ctl.py must always be placed in camilladsp_test/
+#   (the Qji app reads it from there too).
+#   The distributed file name is qji_field_ctl.py, but qji_field_ctl_en.py is also accepted.
+cp "$SCRIPT_DIR/wobble_v7.py" "$QJI_DIR/camilladsp_test/"
+cp "$SCRIPT_DIR/wobble_v8.py" "$QJI_DIR/camilladsp_test/"
+FIELD_SRC=""
+for _cand in qji_field_ctl.py qji_field_ctl_en.py; do
+    if [ -f "$SCRIPT_DIR/$_cand" ]; then FIELD_SRC="$SCRIPT_DIR/$_cand"; break; fi
+done
+if [ -n "$FIELD_SRC" ]; then
+    FIELD_DST="$QJI_DIR/camilladsp_test/qji_field_ctl.py"
+    if [ -f "$FIELD_DST" ] && ! cmp -s "$FIELD_SRC" "$FIELD_DST"; then
+        cp "$FIELD_DST" "${FIELD_DST}.bak_$(date +%Y%m%d_%H%M%S)"
+        ok "Backed up the existing qji_field_ctl.py"
+    fi
+    cp "$FIELD_SRC" "$FIELD_DST"
+    ok "Sound-field presets (qji_field_ctl.py) and wobble_v7/v8 placed"
+else
+    warn "qji_field_ctl.py was not found in the bundled package. The sound-field presets ([e] key) and the v7/v8 wobble will not be available."
+fi
+
 # YAML files: convert the IR (wav) file path to the home-directory-independent
 # {HOME} placeholder before placing it (qji.py expands {HOME} to the real
 # home path at startup).
 # Note: the v5/v6 YAML files had CRLF line endings mixed in, so normalize to LF too.
-for v in 1 2 3 4 5 6; do
+for v in 1 2 3 4 5 6 7 8; do
     sed -E 's#/home/[^/"]+/camilladsp_test#{HOME}/camilladsp_test#g' \
         "$SCRIPT_DIR/spatial_final_v${v}.yml" | tr -d '\r' \
         > "$QJI_DIR/qjidsp_backup_v${v}/spatial_final.yml"
 done
-ok "DSP config files (v1-v6) placed"
+ok "DSP config files (v1-v8) placed"
 
 # --- Qji app modules (existing files are backed up with a timestamp before being overwritten) ---
 backup_and_install() {
@@ -333,7 +356,7 @@ fi
 # qji.py builds its DSP-related paths (under camilladsp_test/ and
 # qjidsp_backup_vN/) straight from os.path.expanduser("~"), so when
 # everything is unified under ~/qji/ we need to insert "qji/" into
-# those paths. This covers soundfields v1-v6, wobble scripts, and the watchdog.
+# those paths. This covers soundfields v1-v8, wobble scripts, and the watchdog.
 python3 - "$QJI_DIR" << 'PYEOF'
 import sys
 qji_dir = sys.argv[1]
@@ -491,7 +514,7 @@ fi
 # -------------------------------------------------------------
 step "Verification"
 
-for pyfile in qji.py qji_qobuzdsp.py qji_qobuz_browser.py qji_soundcloud.py qji_soundcloud_browser.py qji_ytmusic.py qji_ytmusic_browser.py usb_noise_guard.py; do
+for pyfile in camilladsp_test/qji_field_ctl.py camilladsp_test/wobble_v7.py camilladsp_test/wobble_v8.py qji.py qji_qobuzdsp.py qji_qobuz_browser.py qji_soundcloud.py qji_soundcloud_browser.py qji_ytmusic.py qji_ytmusic_browser.py usb_noise_guard.py; do
     if [ -f "$QJI_DIR/$pyfile" ]; then
         python3 -c "import ast; ast.parse(open('$QJI_DIR/$pyfile').read())" \
             && ok "$pyfile syntax OK" \
@@ -499,7 +522,7 @@ for pyfile in qji.py qji_qobuzdsp.py qji_qobuz_browser.py qji_soundcloud.py qji_
     fi
 done
 
-for v in 1 2 3 4 5 6; do
+for v in 1 2 3 4 5 6 7 8; do
     if camilladsp "$QJI_DIR/qjidsp_backup_v${v}/spatial_final.yml" --check >/dev/null 2>&1; then
         ok "spatial_final_v${v}.yml syntax OK"
     else
@@ -509,6 +532,27 @@ done
 
 python3 -c "import camilladsp; print('  pycamilladsp check OK')" 2>/dev/null || \
     warn "Failed to import pycamilladsp"
+
+# Soundfields v7/v8 move the Aux faders (Volume filters) during playback.
+# With an old CamillaDSP / pycamilladsp, the v7/v8 configs may not load, or the wobble may not move.
+# On the CamillaDSP side, passing the syntax check of spatial_final_v7/v8.yml above is enough.
+# For pycamilladsp, check that set_volume accepts a fader number (two arguments).
+# (If this cannot be determined, nothing is said.)
+PYCDSP_RC=0
+python3 - << 'PYEOF' 2>/dev/null || PYCDSP_RC=$?
+import inspect, sys
+try:
+    from camilladsp import CamillaClient
+    c = CamillaClient("127.0.0.1", 1)
+    n = len(inspect.signature(c.volume.set_volume).parameters)
+    sys.exit(0 if n >= 2 else 2)
+except Exception:
+    sys.exit(0)
+PYEOF
+if [ "$PYCDSP_RC" -eq 2 ]; then
+    warn "pycamilladsp may be out of date (it does not support the fader argument needed for the v7/v8 wobble and volume-link)."
+    warn "  Update it with: pip install -U \"git+https://github.com/HEnquist/pycamilladsp.git\" $PIP_FLAGS"
+fi
 
 command -v yt-dlp >/dev/null 2>&1 && ok "yt-dlp check OK: $(yt-dlp --version)" || warn "yt-dlp not found"
 command -v deno >/dev/null 2>&1 && ok "deno check OK: $(deno --version | head -n1)" || warn "deno not found (please restart your terminal and check again)"
@@ -526,10 +570,14 @@ echo "    Use your existing Qji desktop icon as-is."
 echo "    (Manual launch: cd ${QJI_DIR} && python3 qji.py)"
 echo ""
 echo "  After launching, select \"Loopback\" as the output device to"
-echo "  choose from six 3D spatial audio modes (v1-v6):"
+echo "  choose from eight 3D spatial audio modes (v1-v8):"
 echo "    1) Rich hall (static)         2) Rich hall (dynamic)"
 echo "    3) Natural timbre (static)    4) Natural timbre (dynamic, gentle panning)"
 echo "    5) Harmonics mode             6) Harmonics mode (for headphones)"
+echo "    7) Harmonic Hall mode         8) Tangible Hall"
+echo ""
+echo "  During playback, the [e] key opens the sound-field presets (violin beautifully, vocal forward,"
+echo "  wobble, volume-link, and more). With soundfields v7 / v8 the wobble and volume-link are active too."
 echo ""
 echo "  Your DAC (audio interface) can be auto-detected and selected"
 echo "  right after choosing a DSP mode."

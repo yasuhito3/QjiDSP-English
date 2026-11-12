@@ -10,11 +10,20 @@ Cover-art browser / music playback system
 - Config file: ~/.music_player_presets.json
 
 [Added] DSP venue switching and bypass
-- [D] on the home screen switches the DSP venue (v1-v6)
-- During radio / AirPlay / DLNA playback: [1]-[6] switch the venue, [0] toggles DSP bypass (pass-through)
+- [D] on the home screen switches the DSP venue (v1-v8)
+- During radio / AirPlay / DLNA playback: [1]-[8] switch the venue, [0] toggles DSP bypass (pass-through)
 - During local-file playback: [0] also toggles DSP bypass (pass-through)
 - The radio reset key moved from [0] to [r]
 - During playback, [u]/[k]/[j]/[y] toggle / show the USB output noise guard (needs usb_noise_guard.py; everything still works without it)
+
+[Added] v7 Harmonic Hall mode / v8 Tangible Hall, and sound-field presets
+- v7 Harmonic Hall mode (v5-based): not muffled, easy to listen to. Needs wobble_v7.py and ~/qjidsp_backup_v7/spatial_final.yml
+- v8 Tangible Hall (v5-based): denser reverberance with a strong sense of physical presence. Needs wobble_v8.py and ~/qjidsp_backup_v8/spatial_final.yml
+- During playback, [e] opens the sound-field presets (instrument / vocal / wobble / volume-linked / memory). Needs qji_field_ctl.py; everything still works without it
+
+[Added] Seamless cover art in folder playback
+- During folder playback the cover-art window (feh) is no longer closed between tracks; the composited image is simply swapped, so the desktop / terminal never flashes into view
+- Set COVER_SEAMLESS_FOLDER = False to return to the old behaviour
 """
 
 import os
@@ -316,8 +325,18 @@ current_playback_mode = 'tempo'
 stop_playback = False
 current_processes = {'ffmpeg': None, 'aplay': None, 'feh': None}
 output_device = 'hw:2,0'
+# ★★★ Sound-field presets ([e] -> ...). Put qji_field_ctl.py in the camilladsp_test folder (shared with wobble) ★★★
+try:
+    # Found in either ~/qji/camilladsp_test/ (QjiDSP installer layout) or ~/camilladsp_test/ (manual placement)
+    for _fp_dir in (os.path.expanduser('~/qji/camilladsp_test'), os.path.expanduser('~/camilladsp_test')):
+        if os.path.isdir(_fp_dir) and _fp_dir not in sys.path:
+            sys.path.append(_fp_dir)
+    import qji_field_ctl as _qjifield
+    _qjifield.init()   # Don't carry state over from the previous run (wobble and volume-link default to ON)
+except Exception:
+    _qjifield = None
 dsp_mode_active = False  # DSPモード時はTrue（48000Hz固定）
-current_dsp_venue = None  # ★ Live [1]-[6] key switching: currently active DSP mode (v1-v6). Set at startup selection / by switch_dsp_venue()
+current_dsp_venue = None  # ★ Live [1]-[8] key switching: currently active DSP venue (V1-V8). Set at startup selection / by switch_dsp_venue()
 DSP_VENUE_LABELS = {
     '1': '🏛️ Rich hall (still)',
     '2': '🏛️ Rich hall (moving)',
@@ -325,11 +344,21 @@ DSP_VENUE_LABELS = {
     '4': '🎙️ Natural tone (moving)',
     '5': '🎻 Harmonics mode',
     '6': '🎧 Harmonics mode (HP)',
+    '7': '🎚️ Harmonic Hall mode',
+    '8': '🎭 Tangible Hall',
     '0': '⚪ DSP bypass (pass-through)',
-}  # ★ Labels for the cover-art badge (matches the startup DSP mode menu wording)
-_dsp_venue_before_bypass = None  # ★ Venue (1-6) active just before bypass ([0]) was turned on; restored when it is turned off
+}  # ★ Labels for the cover-art badge
+_dsp_venue_before_bypass = None  # ★ Venue (V1-V8) active just before bypass ([0]) was turned on; restored when it is turned off
 current_playing_track = None
 current_image_path = None
+
+# ★★★ Keep the cover-art window (feh) open between tracks in folder playback ★★★
+# True : During folder playback feh stays open and the composited image file (with track info)
+#        is simply swapped for the next track (feh's --reload refreshes it automatically).
+#        The desktop / terminal no longer flashes into view between tracks.
+# False: As before, close and relaunch feh for every track.
+COVER_SEAMLESS_FOLDER = True
+COVER_WITH_INFO_PATH = "/tmp/musicaplayer_covers/current_cover_with_info.jpg"
 next_track_requested = False
 prev_track_requested = False
 mode_change_requested = False
@@ -2426,7 +2455,7 @@ def get_sample_rate(file_path):
             '-of', 'default=noprint_wrappers=1:nokey=1',
             file_path
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
         if result.returncode == 0 and result.stdout.strip():
             return int(result.stdout.strip())
     except:
@@ -2434,6 +2463,76 @@ def get_sample_rate(file_path):
     
     # デフォルト値を返す
     return 44100
+
+
+def get_channel_count(file_path):
+    """
+    Return the channel count of an audio file.
+    Returns None if it cannot be determined (treated as undecidable, i.e. no warning).
+    """
+    try:
+        audio = File(file_path)
+        if audio and hasattr(audio.info, 'channels'):
+            return int(audio.info.channels)
+    except Exception:
+        pass
+
+    try:
+        cmd = [
+            'ffprobe',
+            '-v', 'error',
+            '-select_streams', 'a:0',
+            '-show_entries', 'stream=channels',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            file_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        if result.returncode == 0 and result.stdout.strip():
+            return int(result.stdout.strip())
+    except Exception:
+        pass
+
+    return None
+
+
+def _check_gapless_batch_format_mismatch(batch_tracks, expected_rate):
+    """
+    For every track in a gapless batch, check beforehand that the sample rate / channel count
+    matches the first track.
+
+    ffmpeg's concat demuxer (-f concat) does not re-align the stream format
+    between segments. So if a track with a different format is mixed into
+    the middle of a batch, ffmpeg may terminate abnormally the moment it switches
+    to that track (a typical cause when playback suddenly dies on one particular
+    track of a LAN source).
+
+    Here every track is probed lightly before playback starts, and any track that
+    differs from the first one is named in a warning. This is a warning only;
+    playback itself is not stopped (the probe could occasionally be wrong).
+    """
+    mismatches = []
+    for track in batch_tracks:
+        path = track.get('path', '')
+        if not path or not os.path.exists(path):
+            continue
+        rate = get_sample_rate(path)
+        channels = get_channel_count(path)
+        if rate and rate != expected_rate:
+            name = track.get('title', os.path.basename(path))
+            mismatches.append(f"  - {name} ... {rate}Hz (other tracks: {expected_rate}Hz)")
+        elif channels is not None and channels not in (1, 2):
+            # Anything other than mono/stereo (e.g. a single surround track mixed in) also deserves a warning
+            name = track.get('title', os.path.basename(path))
+            mismatches.append(f"  - {name} ... {channels}ch")
+
+    if mismatches:
+        print("\n⚠️  Gapless playback: tracks with different formats are mixed in")
+        print("   (Playback may stop at the moment it switches to such a track)")
+        for line in mismatches[:10]:
+            print(line)
+        if len(mismatches) > 10:
+            print(f"  ... and {len(mismatches) - 10} more")
+        print()
 
 
 # ★★★ 音量一定化(loudnorm)用: 実測値キャッシュ ★★★
@@ -3043,11 +3142,46 @@ def get_metadata(filepath):
         return {'title': os.path.basename(filepath), 'artist': 'Unknown'}
 
 
+def _load_db_path_index():
+    """
+    Load music_mood_db.json once and return a dict of normalized path -> record.
+    It is used to merge DB-derived genre / album / audio_profile / filter_preset /
+    si_preset into track info built by folder scans, after the fact.
+    If the file is missing or broken, an empty dict is returned (callers then behave
+    as before, without the DB, so folder playback itself never fails).
+    """
+    index = {}
+    try:
+        if not os.path.exists(DATABASE_FILE):
+            return index
+        with open(DATABASE_FILE, "r", encoding="utf-8") as f:
+            db = json.load(f)
+        if not isinstance(db, list):
+            return index
+        for rec in db:
+            if isinstance(rec, dict) and rec.get("path"):
+                index[os.path.normpath(rec["path"])] = rec
+    except Exception:
+        pass
+    return index
+
+
 def get_folder_tracks(folder_path):
-    """フォルダ内の音楽ファイル一覧を取得"""
+    """
+    Get the list of music files in a folder.
+    Fix: this used to build "bare" track dicts holding only ID3 tags (title/artist),
+    so the audio_profile / filter_preset (sound-field choice) saved to
+    music_mood_db.json with the [s] key was never consulted at the entry point of
+    album (folder) playback, and every time the same album was opened again it fell
+    back to the pre-save state (automatic genre detection or the default).
+    Here the DB record is looked up by path and, if it exists, genre / album /
+    audio_profile / filter_preset / si_preset are merged in, so a saved sound-field
+    choice is restored correctly in folder playback as well.
+    """
     try:
         if not os.path.exists(folder_path) or not os.path.isdir(folder_path):
             return []
+        db_index = _load_db_path_index()
         tracks = []
         for item in sorted(os.listdir(folder_path)):
             item_path = os.path.join(folder_path, item)
@@ -3059,6 +3193,13 @@ def get_folder_tracks(folder_path):
                     'artist': metadata['artist'],
                     'filename': item
                 }
+                # Merge the sound-field related fields if a DB record exists
+                db_rec = db_index.get(os.path.normpath(item_path))
+                if db_rec:
+                    for key in ('genre', 'album', 'audio_profile',
+                                'filter_preset', 'si_preset'):
+                        if key in db_rec and db_rec[key] not in (None, ''):
+                            track_info[key] = db_rec[key]
                 tracks.append(track_info)
         return tracks
     except Exception as e:
@@ -3327,6 +3468,7 @@ def show_cover_image(image_path):
 def create_cover_with_info(image_path, track_info):
     """ジャケット画像に曲情報を重ねた画像を作成"""
     global air_particle_layer, musikverein_room_effects, current_filter_preset, current_gain_preset
+    global current_dsp_venue  # ★ For the cover-art badge
     try:
         # ImageMagickの確認
         subprocess.run(['which', 'convert'], check=True, capture_output=True)
@@ -3338,7 +3480,10 @@ def create_cover_with_info(image_path, track_info):
         # 一時ファイルを作成
         temp_dir = "/tmp/musicaplayer_covers"
         os.makedirs(temp_dir, exist_ok=True)
-        output_path = os.path.join(temp_dir, "current_cover_with_info.jpg")
+        final_output_path = os.path.join(temp_dir, "current_cover_with_info.jpg")
+        # ★ Composite into a work file, then swap it in instantly with os.replace once finished.
+        #   Prevents feh (--reload) from reading a half-composited image and garbling the screen.
+        output_path = os.path.join(temp_dir, "current_cover_with_info_work.jpg")
         
         # ★★★ 画像を一定サイズにリサイズ ★★★
         # 標準サイズを設定（例：1200x1200）
@@ -3561,11 +3706,11 @@ def create_cover_with_info(image_path, track_info):
                 subprocess.run(preset_composite_cmd, capture_output=True, check=True, timeout=5)
         except Exception:
             pass  # プリセットバッジ生成失敗は無視して通常画像を使用
-        
-        # ★★★ Sound-field badge (top-left, 2nd row): shows the active DSP mode (v1-v6) ★★★
+
+        # ★★★ Sound-field badge (top-left, 2nd row): shows the active CamillaDSP venue (V1-V8) ★★★
         try:
             if current_dsp_venue:
-                _venue_badge_label = DSP_VENUE_LABELS.get(current_dsp_venue, f"v{current_dsp_venue}")
+                _venue_badge_label = DSP_VENUE_LABELS.get(current_dsp_venue, f"V{current_dsp_venue}")
                 _venue_badge_text = f"🎧 {_venue_badge_label}"
 
                 venue_badge_path = os.path.join(temp_dir, "venue_badge.png")
@@ -3596,7 +3741,10 @@ def create_cover_with_info(image_path, track_info):
         except Exception:
             pass  # If the sound-field badge fails to render, just use the plain image
         
-        return output_path if os.path.exists(output_path) else image_path
+        if os.path.exists(output_path):
+            os.replace(output_path, final_output_path)
+            return final_output_path
+        return image_path
     
     except Exception as e:
         # エラーが発生した場合は元の画像を返す
@@ -3705,15 +3853,12 @@ def shutdown_dsp():
 
 def switch_dsp_venue(dsp_choice):
     """
-    ★ Live-switch the DSP mode (v1-v6) during playback with the [1]-[6] keys.
+    ★ Live-switch the DSP venue (V1-V8) during playback with the [1]-[8] keys.
 
-    Uses the same _yml_map / _wobble_map as the startup DSP selection,
-    restarting CamillaDSP and wobble in place. The current DAC output
-    (device/format) is carried over unchanged into the new YAML, so only
-    the sound field changes — the output destination doesn't need to be
-    reselected. The ffmpeg->aplay audio pipeline is never touched, so the
-    currently playing track keeps playing without a restart.
-
+    Unlike reinitialize_dsp_output(), this does not reselect the DAC.
+    The currently active DAC output (device/format) is saved first and
+    carried over unchanged into the new venue's YAML, so only the sound
+    field changes — the output destination stays the same.
     Returns True on success, False on failure.
     """
     global current_dsp_venue
@@ -3737,7 +3882,6 @@ def _switch_dsp_venue_impl(dsp_choice):
     _HOME = os.path.expanduser("~")
     _live_yml = f'{_HOME}/camilladsp_test/spatial_final.yml'
 
-    # ★ Same mapping as the startup DSP mode menu (v1-v6 only)
     _yml_map = {
         '1': f'{_HOME}/qjidsp_backup_v1/spatial_final.yml',
         '2': f'{_HOME}/qjidsp_backup_v2/spatial_final.yml',
@@ -3745,6 +3889,8 @@ def _switch_dsp_venue_impl(dsp_choice):
         '4': f'{_HOME}/qjidsp_backup_v4/spatial_final.yml',
         '5': f'{_HOME}/qjidsp_backup_v5/spatial_final.yml',
         '6': f'{_HOME}/qjidsp_backup_v6/spatial_final.yml',
+        '7': f'{_HOME}/qjidsp_backup_v7/spatial_final.yml',
+        '8': f'{_HOME}/qjidsp_backup_v8/spatial_final.yml',
     }
     _wobble_map = {
         '1': f'{_HOME}/camilladsp_test/wobble_v1.py',
@@ -3753,6 +3899,8 @@ def _switch_dsp_venue_impl(dsp_choice):
         '4': f'{_HOME}/camilladsp_test/wobble_v4.py',
         '5': f'{_HOME}/camilladsp_test/wobble_v5.py',
         '6': f'{_HOME}/camilladsp_test/wobble_v5_harmonics_hp.py',
+        '7': f'{_HOME}/camilladsp_test/wobble_v7.py',
+        '8': f'{_HOME}/camilladsp_test/wobble_v8.py',
     }
 
     if dsp_choice not in _yml_map:
@@ -3794,7 +3942,7 @@ def _switch_dsp_venue_impl(dsp_choice):
             _yml_content = _f_src.read()
         _yml_content = _yml_content.replace('{HOME}', _HOME)
 
-        # ★ Carry the saved DAC device/format settings over into the new mode's YAML
+        # ★ Carry the saved DAC device/format settings over into the new venue's YAML
         if _current_device_line or _current_format_line:
             _new_lines2 = []
             _in_playback2 = False
@@ -3852,6 +4000,11 @@ def _switch_dsp_venue_impl(dsp_choice):
 
     _reapply_usb_guard(_usb_prev)  # ★ carry the RT priority over to the new CamillaDSP/wobble PIDs
     current_dsp_venue = dsp_choice
+    try:
+        if _qjifield is not None:
+            _qjifield.set_venue(dsp_choice)   # ★ v7/v8: switch the strength of reverberance / wobble / volume-link
+    except Exception:
+        pass
     terminal_print(f"✅ Switched to DSP v{dsp_choice}")
     return True
 
@@ -4095,12 +4248,12 @@ def toggle_dsp_bypass():
     try:
         if current_dsp_venue == '0':
             _back = _dsp_venue_before_bypass or '1'
-            terminal_print(f"\n🎛️ Leaving DSP bypass, returning to {DSP_VENUE_LABELS.get(_back, 'v' + _back)}...")
+            terminal_print(f"\n🎛️ Leaving DSP bypass, returning to {DSP_VENUE_LABELS.get(_back, 'V' + _back)}...")
             return _switch_dsp_venue_impl(_back)
         return _enable_dsp_bypass()
     except Exception as _e:
         terminal_print(f"❌ Unexpected error while toggling DSP bypass: {_e}")
-        terminal_print("💡 Playback continues. If things seem unstable, pick a venue again with [1]-[6].")
+        terminal_print("💡 Playback continues. If things seem unstable, pick a venue again with [1]-[8].")
         return False
 
 
@@ -4130,7 +4283,7 @@ def _usb_guard_key_action(key):
 
 
 def _switch_dsp_venue_from_stream_key(key):
-    """★ Shared wrapper for the [0]-[6] keys during radio / AirPlay / DLNA playback.
+    """★ Shared wrapper for the [0]-[8] keys during radio / AirPlay / DLNA playback.
     Audio (ffmpeg -> aplay) keeps running; only the CamillaDSP venue changes (~4 s).
     Returns True = switched / False = failed or DSP inactive / None = already on that venue."""
     if not dsp_mode_active:
@@ -4139,7 +4292,7 @@ def _switch_dsp_venue_from_stream_key(key):
     if key == '0':  # ★ DSP bypass (pass-through) ON/OFF
         _ok = toggle_dsp_bypass()
     elif current_dsp_venue == key:
-        print(f"\n   ℹ️ Already on {DSP_VENUE_LABELS.get(key, 'v' + key)}")
+        print(f"\n   ℹ️ Already on {DSP_VENUE_LABELS.get(key, 'V' + key)}")
         return None
     else:
         _ok = switch_dsp_venue(key)
@@ -4150,7 +4303,7 @@ def _switch_dsp_venue_from_stream_key(key):
         pass
     if _ok:
         _cur = current_dsp_venue or key
-        print(f"   🎛️ Current venue: {DSP_VENUE_LABELS.get(_cur, 'v' + str(_cur))}")
+        print(f"   🎛️ Current venue: {DSP_VENUE_LABELS.get(_cur, 'V' + str(_cur))}")
     return _ok
 
 
@@ -4662,7 +4815,7 @@ def play_radio_stream(station):
       [s] 現在の音場設定をこの局に保存（SI EQデルタ含む / ストリーム継続）
       [l] 保存済み他局プリセット一覧→選択して適用（再起動）
       [r] Reset to the default settings (restart)
-      [0] DSP bypass (pass-through) ON/OFF, [1]-[6] switch DSP venue (DSP mode only; the stream keeps running)
+      [0] DSP bypass (pass-through) ON/OFF, [1]-[8] switch DSP venue (DSP mode only; the stream keeps running)
       [q] 停止してメインメニューへ
     """
     global stop_playback, current_processes
@@ -4885,9 +5038,9 @@ def play_radio_stream(station):
             print(f"\n✅ Connected!")
             print(f"🎵 Playing: {country} {name}")
             print(f"   🏛️  {_fp_now}  |  Air Particle: {_space_label}")
-            _ctrl_hint = ("[c]Filter | [x]SI preset | [a]Air layer | [0]Bypass/[1-6]Venue | [u/k/j/m]USB guard | [s]Save | [l]Copy station | [r]Reset | [q]Stop"
+            _ctrl_hint = ("[c]Filter | [x]SI preset | [a]Air layer | [0]Bypass/[1-8]Venue | [u/k/j/m]USB guard | [s]Save | [l]Copy station | [r]Reset | [q]Stop"
                           if SI_AVAILABLE else
-                          "[c]Filter | [a]Air layer | [0]Bypass/[1-6]Venue | [u/k/j/m]USB guard | [s]Save | [l]Copy station | [r]Reset | [q]Stop")
+                          "[c]Filter | [a]Air layer | [0]Bypass/[1-8]Venue | [u/k/j/m]USB guard | [s]Save | [l]Copy station | [r]Reset | [q]Stop")
             print(f"   {_ctrl_hint}")
             print("=" * 60)
 
@@ -4906,8 +5059,8 @@ def play_radio_stream(station):
                         # ★ Toggle / show the USB noise guard (the stream keeps running)
                         _usb_guard_key_action(key)
 
-                    elif key in ('0', '1', '2', '3', '4', '5', '6'):
-                        # ★ [0]=DSP bypass, [1]-[6]=switch the DSP venue in place (the stream keeps running)
+                    elif key in ('0', '1', '2', '3', '4', '5', '6', '7', '8'):
+                        # ★ [0]=DSP bypass, [1]-[8]=switch the DSP venue in place (the stream keeps running)
                         _switch_dsp_venue_from_stream_key(key)
 
                     elif key in ('c', 'x', 'l', 'r', 'a'):
@@ -5546,9 +5699,9 @@ def play_airplay_stream():
             print(f'\n📡 AirPlay receiver starting: "{device_name}"')
             print(f'   Loopback: {loopback_play} → {loopback_cap} → {output_device} ({_fmt_label})')
             print(f'   🏛️  {_fp_label}  |  Air Particle: {_space_label}')
-            _hint = ('[c]Filter|[x]SI preset|[a]Air layer|[h]Musikverein|[0]Bypass/[1-6]Venue|[u/k/j/m]USB|[i]Image|[+/-]Vol|[q]Stop'
+            _hint = ('[c]Filter|[x]SI preset|[a]Air layer|[h]Musikverein|[0]Bypass/[1-8]Venue|[u/k/j/m]USB|[i]Image|[+/-]Vol|[q]Stop'
                      if SI_AVAILABLE else
-                     '[c]Filter|[a]Air layer|[h]Musikverein|[0]Bypass/[1-6]Venue|[u/k/j/m]USB|[i]Image|[+/-]Vol|[q]Stop')
+                     '[c]Filter|[a]Air layer|[h]Musikverein|[0]Bypass/[1-8]Venue|[u/k/j/m]USB|[i]Image|[+/-]Vol|[q]Stop')
             print(f'   {_hint}')
             print('=' * 60)
             print('⏳ Select "Qji" as AirPlay output on your iPhone / Mac...')
@@ -5665,8 +5818,8 @@ def play_airplay_stream():
                             # ★ Toggle / show the USB noise guard (the stream keeps running)
                             _usb_guard_key_action(key)
 
-                        elif key in ('0', '1', '2', '3', '4', '5', '6'):
-                            # ★ [0]=DSP bypass, [1]-[6]=switch the DSP venue in place (the pipeline keeps running)
+                        elif key in ('0', '1', '2', '3', '4', '5', '6', '7', '8'):
+                            # ★ [0]=DSP bypass, [1]-[8]=switch the DSP venue in place (the pipeline keeps running)
                             _switch_dsp_venue_from_stream_key(key)
 
                         elif key in ('c', 'x', 'a', 'h'):
@@ -5856,6 +6009,17 @@ def _gmrender_show_cover(cover_url: str, title: str, artist: str, album: str):
     orig_path  = os.path.join(cover_dir, 'original_cover.jpg')
     final_path = os.path.join(cover_dir, 'current_cover.jpg')
 
+    # ★★★ Diagnostic log: for investigating why DLNA cover art doesn't show ★★★
+    _log_path = '/tmp/qji_gmrender_cover_debug.log'
+    def _dbglog(msg):
+        try:
+            with open(_log_path, 'a', encoding='utf-8') as _lf:
+                _lf.write(f"{time.strftime('%H:%M:%S')} [show_cover] {msg}\n")
+        except Exception:
+            pass
+
+    _dbglog(f"start: url={cover_url!r} title={title!r}")
+
     try:
         # ── カバー画像ダウンロード ──────────────────────────────────────
         req = urllib.request.Request(cover_url,
@@ -5863,6 +6027,7 @@ def _gmrender_show_cover(cover_url: str, title: str, artist: str, album: str):
         with urllib.request.urlopen(req, timeout=10) as resp:
             with open(orig_path, 'wb') as f:
                 f.write(resp.read())
+        _dbglog(f"download OK: {os.path.getsize(orig_path)} bytes")
 
         # ── テキスト合成（ImageMagick があれば）────────────────────────
         if shutil.which('convert') and shutil.which('identify'):
@@ -5896,10 +6061,13 @@ def _gmrender_show_cover(cover_url: str, title: str, artist: str, album: str):
                 if os.path.isfile(tmp_path):
                     os.replace(tmp_path, final_path)
                 else:
+                    _dbglog("convert produced no tmp_path — falling back to plain cover")
                     shutil.copy2(orig_path, final_path)
-            except Exception:
+            except Exception as _e_conv:
+                _dbglog(f"convert step failed: {_e_conv!r} — falling back to plain cover")
                 shutil.copy2(orig_path, final_path)
         else:
+            _dbglog("ImageMagick (convert/identify) not found — using plain cover")
             shutil.copy2(orig_path, final_path)
 
         # ── feh 表示 ───────────────────────────────────────────────────
@@ -5908,15 +6076,23 @@ def _gmrender_show_cover(cover_url: str, title: str, artist: str, album: str):
         time.sleep(0.05)
         env = dict(os.environ)
         env.setdefault('DISPLAY', ':0')
-        subprocess.Popen(
+        _feh_proc = subprocess.Popen(
             ['feh', '--fullscreen', '--auto-zoom', '--borderless',
              '--no-menus', '--title', 'Now Playing', final_path],
             env=env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-    except Exception:
-        pass   # カバー表示失敗は無音で無視
+        time.sleep(0.3)
+        if _feh_proc.poll() is not None:
+            # ★ feh exited immediately = it probably could not display (DISPLAY / X access, etc.)
+            _dbglog(f"feh exited immediately with code {_feh_proc.returncode} "
+                    f"(DISPLAY={env.get('DISPLAY')}) — image was likely NOT shown")
+        else:
+            _dbglog(f"feh launched OK (pid={_feh_proc.pid}, DISPLAY={env.get('DISPLAY')})")
+    except Exception as e:
+        _dbglog(f"EXCEPTION: {e!r}")
+        pass   # Cover-display failures are silently ignored (but recorded in the log)
 
 
 def _gmrender_cover_poller(stop_event, port=49494):
@@ -5933,10 +6109,45 @@ def _gmrender_cover_poller(stop_event, port=49494):
     import re as _re
     import hashlib
     import socket as _socket
+    import subprocess as _subprocess
+    import shutil as _shutil
 
-    # libupnp は LAN IP にバインドするため localhost では繋がらない。
-    # ダミー UDP 接続でルーティングに使われる LAN IP を動的取得する。
-    def _get_lan_ip():
+    _log_path = '/tmp/qji_gmrender_cover_debug.log'
+    def _dbglog(msg):
+        try:
+            with open(_log_path, 'a', encoding='utf-8') as _lf:
+                _lf.write(f"{time.strftime('%H:%M:%S')} [poller] {msg}\n")
+        except Exception:
+            pass
+
+    # ★★★ Fix: stop "guessing" the LAN IP via a dummy UDP connection; instead read the IPv4
+    #   address gmediarender actually binds to directly from ss/netstat.
+    #
+    #   On machines with several IPs (wired + Wi-Fi, stale DHCP leases, etc.), the IP the OS
+    #   would use for the destination (from the dummy UDP connection) can differ from the IP
+    #   gmediarender (libupnp) really binds to, and then the poller gets
+    #   "Connection refused" forever (this bug actually occurred).
+    #   Looking at the IP that is actually LISTENing makes this mismatch impossible in principle.
+    def _get_gmediarender_bound_ip():
+        try:
+            for _tool_cmd in (['ss', '-ltnp'], ['netstat', '-ltnp']):
+                if not _shutil.which(_tool_cmd[0]):
+                    continue
+                _out = _subprocess.run(_tool_cmd, capture_output=True, text=True, timeout=3).stdout
+                for _line in _out.splitlines():
+                    if 'gmediarender' not in _line:
+                        continue
+                    _m = _re.search(r'(\d+\.\d+\.\d+\.\d+):' + str(port) + r'\b', _line)
+                    if _m and _m.group(1) != '0.0.0.0':
+                        return _m.group(1)
+                break  # One available tool is enough. If missing, try the next tool
+        except Exception:
+            pass
+        return None
+
+    # ★ Kept only as the last-resort fallback for environments where the above is unavailable
+    #   (no ss/netstat, etc.): the dummy UDP connection method.
+    def _get_lan_ip_fallback():
         try:
             with _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM) as _s:
                 _s.connect(('192.168.0.1', 1))   # 送信しない。OSがsrcIPを決める
@@ -5973,16 +6184,35 @@ def _gmrender_cover_poller(stop_event, port=49494):
             pass
         return f'http://{ip}:{port}/upnp/control/rendertransport1'  # fallback
 
-    _ip     = _get_lan_ip()
-    _CTRL   = _find_ctrl_url(_ip)   # 例: http://192.168.11.22:49494/upnp/control/rendertransport1
+    _ip = None    # ★ None until determined inside the loop (it may not be bound yet right after startup)
+    _CTRL = None
     _ACTION = '"urn:schemas-upnp-org:service:AVTransport:1#GetPositionInfo"'
 
+    _dbglog(f"started (waiting to detect gmediarender's actual bound IP)")
+
     last_hash = ''
+    _err_count = 0
 
     while not stop_event.is_set():
         stop_event.wait(2.0)   # 2 秒待機。stop_event.set() で即時脱出
         if stop_event.is_set():
             break
+
+        # ★ If the IP isn't determined yet, detect gmediarender's actual bind address again.
+        #   This check runs only while the IP is undetermined (normally settled within the first 1-2 passes).
+        if _CTRL is None:
+            _detected_ip = _get_gmediarender_bound_ip()
+            if _detected_ip:
+                _ip = _detected_ip
+                _CTRL = _find_ctrl_url(_ip)
+                _dbglog(f"Detected gmediarender's actual bound IP: {_ip} -> ctrl_url={_CTRL}")
+            else:
+                _fallback_ip = _get_lan_ip_fallback()
+                _dbglog(f"Could not detect the bound IP via ss/netstat; using the fallback LAN-IP guess: {_fallback_ip} "
+                        f"(this method can disagree with the real bind address on multi-IP machines)")
+                _ip = _fallback_ip
+                _CTRL = _find_ctrl_url(_ip)
+
         try:
             req = urllib.request.Request(
                 _CTRL, data=_SOAP,
@@ -5997,9 +6227,11 @@ def _gmrender_cover_poller(stop_event, port=49494):
             # TrackMetaData タグを取得（DIDL-Lite が HTML エンコードで入っている）
             m = _re.search(r'<TrackMetaData>(.*?)</TrackMetaData>', body, _re.DOTALL)
             if not m:
+                _dbglog("no <TrackMetaData> tag in GetPositionInfo response")
                 continue
             raw = m.group(1).strip()
             if not raw or raw in ('NOT_IMPLEMENTED', 'NO_MEDIA_PRESENT', ''):
+                _dbglog(f"TrackMetaData empty/placeholder: {raw!r}")
                 continue
 
             meta = _html.unescape(raw)   # &lt; → < 等を戻す
@@ -6015,7 +6247,15 @@ def _gmrender_cover_poller(stop_event, port=49494):
             cover  = _re.search(r'<upnp:albumArtURI>([^<]*)</upnp:albumArtURI>', meta)
 
             if not title or not cover:
+                # ★ The most common reason for "no image": the control app does not include
+                #   the album-art URI in its DIDL metadata in the first place.
+                #   Log the head of the metadata so the cause is obvious next time.
+                _dbglog(f"missing title or albumArtURI (title={bool(title)}, cover={bool(cover)}); "
+                        f"meta head: {meta[:300]!r}")
                 continue
+
+            _dbglog(f"new track detected: title={title.group(1).strip()!r} "
+                    f"cover_url={cover.group(1).strip()!r}")
 
             threading.Thread(
                 target=_gmrender_show_cover,
@@ -6028,8 +6268,13 @@ def _gmrender_cover_poller(stop_event, port=49494):
                 daemon=True,
             ).start()
 
-        except Exception:
-            pass   # gmrender 起動前・停止後は例外が出るが無視
+        except Exception as e:
+            _err_count += 1
+            if _err_count <= 3 or _err_count % 30 == 0:
+                # ★ Exceptions right after startup / after stopping are normal, so log only the first few
+                #   and then every 30th (about once a minute) so the log doesn't balloon
+                _dbglog(f"poll exception (#{_err_count}): {e!r}")
+            pass   # Exceptions before gmrender starts / after it stops are ignored (but logged)
 
 
 def _stop_gmediarender_all():
@@ -6054,7 +6299,7 @@ def play_gmediarender_stream():
 
     ── キー操作 ──
       [c] フィルター変更  [h] 楽友協会  [a] Air Particle
-      [x] SI プリセット   [+/-] 音量    [q] 停止
+      [x] SI preset   [i] Show image  [+/-] Volume    [q] Stop
     """
     global stop_playback, current_processes
     global tinnitus_reduction_mode, musikverein_room_effects, air_particle_layer
@@ -6170,9 +6415,9 @@ def play_gmediarender_stream():
             print(f'\n📡 UPnP/DLNA receiver starting: "{device_name}"')
             print(f'   Loopback: {loopback_play} → {loopback_cap} → {output_device} ({_fmt_label})')
             print(f'   🏛️  {_fp_label}  |  Space: {_space_label}')
-            _hint = ('[c]Filter|[x]SI preset|[a]Air layer|[h]Musikverein|[0]Bypass/[1-6]Venue|[u/k/j/m]USB|[+/-]Vol|[q]Stop'
+            _hint = ('[c]Filter|[x]SI preset|[a]Air layer|[h]Musikverein|[0]Bypass/[1-8]Venue|[u/k/j/m]USB|[i]Image|[+/-]Vol|[q]Stop'
                      if SI_AVAILABLE else
-                     '[c]Filter|[a]Air layer|[h]Musikverein|[0]Bypass/[1-6]Venue|[u/k/j/m]USB|[+/-]Vol|[q]Stop')
+                     '[c]Filter|[a]Air layer|[h]Musikverein|[0]Bypass/[1-8]Venue|[u/k/j/m]USB|[i]Image|[+/-]Vol|[q]Stop')
             print(f'   {_hint}')
             print('=' * 60)
 
@@ -6218,7 +6463,49 @@ def play_gmediarender_stream():
                         print('   Log: /tmp/qji_gmediarender.log')
                         input('   [Press Enter to return to menu...]')
                         return
+                    # ★★★ Diagnostics: record which port gmediarender is actually listening on ★★★
+                    # Even with --port 49494, depending on the gmediarender build it may
+                    # not be reflected in the real listening port, in which case the cover-art
+                    # poller (which sends SOAP to port 49494 fixed) gets "Connection refused"
+                    # forever. Recording the real listen state here makes it easy to tell at a glance.
+                    def _log_listen_snapshot(_when_label):
+                        try:
+                            _ss_out = None
+                            for _tool_cmd in (['ss', '-ltnp'], ['netstat', '-ltnp']):
+                                if shutil.which(_tool_cmd[0]):
+                                    _ss_out = subprocess.run(
+                                        _tool_cmd, capture_output=True, text=True, timeout=3
+                                    ).stdout
+                                    break
+                            with open('/tmp/qji_gmrender_cover_debug.log', 'a', encoding='utf-8') as _lf:
+                                if _ss_out is None:
+                                    _lf.write(f"{time.strftime('%H:%M:%S')} [launch/{_when_label}] "
+                                              f"ss/netstat not found, so the listening state could not be checked\n")
+                                else:
+                                    _gm_lines = [l for l in _ss_out.splitlines()
+                                                 if str(gmrender_proc.pid) in l or 'gmediarender' in l]
+                                    _lf.write(f"{time.strftime('%H:%M:%S')} [launch/{_when_label}] "
+                                              f"gmediarender pid={gmrender_proc.pid}, listening sockets:\n")
+                                    if _gm_lines:
+                                        for _l in _gm_lines:
+                                            _lf.write(f"    {_l}\n")
+                                    else:
+                                        _lf.write("    (no matching LISTEN socket found"
+                                                  " — gmediarender may not have opened its HTTP server)\n")
+                        except Exception as _e_ss:
+                            try:
+                                with open('/tmp/qji_gmrender_cover_debug.log', 'a', encoding='utf-8') as _lf:
+                                    _lf.write(f"{time.strftime('%H:%M:%S')} [launch/{_when_label}] ss check failed: {_e_ss!r}\n")
+                            except Exception:
+                                pass
+
+                    # ★ Take two snapshots: right after launch (~1.5 s) and after a short wait (~6 s).
+                    #   This tells apart the case where gmediarender's HTTP server starts slowly.
+                    _log_listen_snapshot('right-after')
+                    threading.Timer(5.0, _log_listen_snapshot, args=('6s-later',)).start()
+
                     print(f'\n✅ Waiting — select "{device_name}" in your UPnP controller and start playing')
+                    print('   💡 If the cover art does not appear, check /tmp/qji_gmrender_cover_debug.log')
                 else:
                     print(f'\n🔄 Filter updated — restarting (UPnP connection kept)...')
 
@@ -6275,12 +6562,36 @@ def play_gmediarender_stream():
                             print(f'\n   🔊 Output gain: {CURRENT_VOLUME:+d} dB')
                             _keep_gmrender = True; restart_stream = True; break
 
+                        elif key == 'i':
+                            # ★★★ [i] Redisplay the cover image shown last ★★★
+                            # _gmrender_show_cover() always overwrites the same fixed path
+                            # (/tmp/gmediarender_covers/current_cover.jpg), so the file is still there
+                            # after closing with Esc. No re-download is needed;
+                            # just launch feh again (unrelated to playback / audio).
+                            _dlna_cover_path = '/tmp/gmediarender_covers/current_cover.jpg'
+                            if os.path.exists(_dlna_cover_path):
+                                subprocess.run(['pkill', '-f', 'feh.*current_cover'],
+                                               capture_output=True)
+                                time.sleep(0.05)
+                                _env_i = dict(os.environ)
+                                _env_i.setdefault('DISPLAY', ':0')
+                                subprocess.Popen(
+                                    ['feh', '--fullscreen', '--auto-zoom', '--borderless',
+                                     '--no-menus', '--title', 'Now Playing', _dlna_cover_path],
+                                    env=_env_i,
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL,
+                                )
+                                print('\n   🖼️  Cover image shown again')
+                            else:
+                                print('\n   ⚠️ No cover image yet (it will appear when the track changes)')
+
                         elif key in ('u', 'k', 'j', 'm', 'y'):
                             # ★ Toggle / show the USB noise guard (the stream keeps running)
                             _usb_guard_key_action(key)
 
-                        elif key in ('0', '1', '2', '3', '4', '5', '6'):
-                            # ★ [0]=DSP bypass, [1]-[6]=switch the DSP venue in place (the pipeline keeps running)
+                        elif key in ('0', '1', '2', '3', '4', '5', '6', '7', '8'):
+                            # ★ [0]=DSP bypass, [1]-[8]=switch the DSP venue in place (the pipeline keeps running)
                             _switch_dsp_venue_from_stream_key(key)
 
                         elif key in ('c', 'x', 'a', 'h'):
@@ -9020,7 +9331,7 @@ def _si_do_hall_select():
         rt = s["rt60"]; bar = "█" * int(rt * 3)
         print(f"│  {mark} {i}. {s['display_name'][:36]:<36} RT={rt:.1f}s {bar:<6} │")
     print("└───────────────────────────────────────────────────────┘")
-    choice = _si_readline("  選択 → ")
+    choice = _si_readline("  Select → ")
     if choice.isdigit():
         idx = int(choice) - 1
         if 0 <= idx < len(spaces) and _si_instance.current_params:
@@ -9060,7 +9371,7 @@ def _si_do_profile_select():
     for i, p in enumerate(presets, offset + 1):
         print(f"│    {i}. {p['display_name'][:38]:<38} │")
     print("└──────────────────────────────────────────────┘")
-    choice = _si_readline("  選択 → ")
+    choice = _si_readline("  Select → ")
     if choice.isdigit():
         idx = int(choice) - 1
         try:
@@ -9179,7 +9490,7 @@ def _si_do_album_preset():
     print("│  [Enter only] Cancel                                 │")
     print("└─────────────────────────────────────────────────────┘")
 
-    choice = _si_readline("  選択番号 → ")
+    choice = _si_readline("  Enter number → ")
     if not choice or not choice.strip().isdigit():
         print("  Cancelled")
         return
@@ -9284,7 +9595,7 @@ def _si_do_preset_menu():
     print("│  [Enter only] Cancel                                 │")
     print("└─────────────────────────────────────────────────────┘")
 
-    choice = _si_readline("  選択 → ")
+    choice = _si_readline("  Select → ")
     if not choice:
         print("  Cancelled")
         return
@@ -9341,6 +9652,18 @@ def _si_do_preset_menu():
             except Exception as e:
                 print(f"  ⚠️ {label}: {e}")
 
+    # ★★★ Remember the SI EQ confirmed in the [x] menu as the fixed value for this track ★★★
+    #   Stops the automatic reload that follows from re-reading the saved profile / SI memory
+    #   and undoing an [EQ off] or other adjustment. Valid until the track changes; [s] saves this value.
+    try:
+        if (_qjifield is not None and _si_instance.current_params is not None
+                and current_playing_track):
+            _qjifield.set_si_eq_override(
+                current_playing_track.get('path', ''),
+                dict(getattr(_si_instance.current_params, 'eq', None) or {}))
+    except Exception:
+        pass
+
     _si_readline("\n  [Press Enter to resume] ")
 
 
@@ -9372,10 +9695,10 @@ def _preset_musikverein(gain_db, current_volume, eq_part, musikverein_room_effec
         'equalizer=f=40:t=q:w=0.75:g=2.2',
         'equalizer=f=60:t=q:w=0.8:g=3.0',
         'equalizer=f=80:t=q:w=0.85:g=2.6',
-        'equalizer=f=2500:t=q:w=2.0:g=-0.8',  # ヴァイオリンのザラつく芯を消す
-        'equalizer=f=3800:t=q:w=2.0:g=-0.6',  # ピアノのアタックの硬さ・濁りを取る
-        'equalizer=f=6200:t=q:w=3.0:g=-1.0',  # エキサイターのチリチリする開始点を叩く
-        'equalizer=f=7400:t=q:w=3.0:g=-1.2',  # 耳障りな高域の擦れ音をピンポイントで消す
+        'equalizer=f=2500:t=q:w=2.0:g=-0.8',  # Remove the gritty core of the violin
+        'equalizer=f=3800:t=q:w=2.0:g=-0.6',  # Remove the hardness / muddiness of piano attacks
+        'equalizer=f=6200:t=q:w=3.0:g=-1.0',  # Hit the starting point of the exciter's fizz
+        'equalizer=f=7400:t=q:w=3.0:g=-1.2',  # Pinpoint-remove the harsh high-frequency scraping
         'equalizer=f=110:t=q:w=0.9:g=-0.6',
         'equalizer=f=140:t=q:w=0.95:g=-0.6',
         'equalizer=f=95:t=q:w=0.85:g=-0.6',
@@ -9464,10 +9787,10 @@ def _preset_piano(gain_db, current_volume, eq_part, musikverein_room_effects,
     parts += [
         'equalizer=f=40:t=q:w=0.75:g=2.2',
         'equalizer=f=60:t=q:w=0.8:g=3.0',
-        'equalizer=f=2500:t=q:w=2.0:g=-0.8',  # ヴァイオリンのザラつく芯を消す
-        'equalizer=f=3800:t=q:w=2.0:g=-0.6',  # ピアノのアタックの硬さ・濁りを取る
-        'equalizer=f=6200:t=q:w=3.0:g=-1.0',  # エキサイターのチリチリする開始点を叩く
-        'equalizer=f=7400:t=q:w=3.0:g=-1.2',  # 耳障りな高域の擦れ音をピンポイントで消す
+        'equalizer=f=2500:t=q:w=2.0:g=-0.8',  # Remove the gritty core of the violin
+        'equalizer=f=3800:t=q:w=2.0:g=-0.6',  # Remove the hardness / muddiness of piano attacks
+        'equalizer=f=6200:t=q:w=3.0:g=-1.0',  # Hit the starting point of the exciter's fizz
+        'equalizer=f=7400:t=q:w=3.0:g=-1.2',  # Pinpoint-remove the harsh high-frequency scraping
         'equalizer=f=80:t=q:w=0.85:g=2.6',
         'equalizer=f=110:t=q:w=0.9:g=-0.6',
         'equalizer=f=140:t=q:w=0.95:g=-0.6',
@@ -9549,8 +9872,7 @@ def _preset_piano(gain_db, current_volume, eq_part, musikverein_room_effects,
         return ['-af', main_chain]
 
 
-def _preset_chamber(gain_db, current_volume, eq_part, musikverein_room_effects,
-                    air_particle_layer, echo_mode, tinnitus_reduction_mode, loudness_filter):
+def _preset_chamber(gain_db, current_volume, eq_part, musikverein_room_effects, air_particle_layer, echo_mode, tinnitus_reduction_mode, loudness_filter):
     """室内楽プリセット。弦楽四重奏・ピアノトリオ等。ピアノフォルテのクリップを二段コンプで防止。"""
     parts = []
     parts.append(f'volume={gain_db}dB')
@@ -9561,10 +9883,10 @@ def _preset_chamber(gain_db, current_volume, eq_part, musikverein_room_effects,
     parts += [
         'equalizer=f=40:t=q:w=0.75:g=1.0',
         'equalizer=f=60:t=q:w=0.8:g=1.2',
-        'equalizer=f=2500:t=q:w=2.0:g=-0.8',  # ヴァイオリンのザラつく芯を消す
-        'equalizer=f=3800:t=q:w=2.0:g=-0.6',  # ピアノのアタックの硬さ・濁りを取る
-        'equalizer=f=6200:t=q:w=3.0:g=-1.0',  # エキサイターのチリチリする開始点を叩く
-        'equalizer=f=7400:t=q:w=3.0:g=-1.2',  # 耳障りな高域の擦れ音をピンポイントで消す
+        'equalizer=f=2500:t=q:w=2.0:g=-0.8', # Remove the gritty core of the violin
+        'equalizer=f=3800:t=q:w=2.0:g=-0.6', # Remove the hardness / muddiness of piano attacks
+        'equalizer=f=6200:t=q:w=3.0:g=-1.0', # Hit the starting point of the exciter's fizz
+        'equalizer=f=7400:t=q:w=3.0:g=-1.2', # Pinpoint-remove the harsh high-frequency scraping
         'equalizer=f=80:t=q:w=0.85:g=1.0',
         'equalizer=f=90:t=q:w=0.8:g=0.4',
         'equalizer=f=100:t=q:w=0.9:g=-0.4',
@@ -9583,6 +9905,7 @@ def _preset_chamber(gain_db, current_volume, eq_part, musikverein_room_effects,
         'equalizer=f=8000:t=q:w=1.5:g=0.2',
         'equalizer=f=6500:t=q:w=1.3:g=-0.5',
     ]
+    
     if musikverein_room_effects:
         parts.append('aecho=0.85:0.88:5:0.04')
         parts.append('aecho=0.90:0.92:3:0.035')
@@ -9592,43 +9915,53 @@ def _preset_chamber(gain_db, current_volume, eq_part, musikverein_room_effects,
         parts.append('acompressor=threshold=-20dB:ratio=1.45:attack=3:release=60:makeup=1.06')
         parts.append('acompressor=threshold=-30dB:ratio=1.32:attack=10:release=120:makeup=1.10')
         parts.append('treble=g=1.1')
-        if tinnitus_reduction_mode:
-            parts.append('highshelf=f=10000:g=-1.2:w=0.5')
-        else:
-            parts.append('highshelf=f=7000:g=0.9:w=0.7')
+        
+    if tinnitus_reduction_mode:
+        parts.append('highshelf=f=10000:g=-1.2:w=0.5')
+    else:
+        parts.append('highshelf=f=7000:g=0.9:w=0.7')
+        
     parts.append('acompressor=threshold=-18dB:ratio=1.08:attack=1:release=25:makeup=1.0')
     parts.append('alimiter=level_in=1.0:level_out=1.0:limit=0.96:attack=1:release=50')
+    
     if loudness_filter:
         parts.append(loudness_filter.rstrip(','))
+        
     # ★ loudnorm使用時は既に-2.0dBTPまで詰まっているため、この段の出力ゲインは
-    #   0dB超（＝さらなるブースト）を許可しない。減衰(マイナス側)のみ有効。
+    # Don't allow anything above 0 dB (= further boosting). Only attenuation (negative side) is effective.
     _post_gain = current_volume if not loudness_filter else min(current_volume, 0)
+    
+    # Change 1: for the else route (-af), subtract a flat 2 dB from the last volume stage of main_chain
+    _post_gain_reduced = _post_gain - 2
     parts.append(
-        f'{eq_part}volume={_post_gain}dB,'
+        f'{eq_part}volume={_post_gain_reduced}dB,'
         'alimiter=level_in=1.0:level_out=1.0:limit=0.92:attack=1:release=50'
     )
+    
     main_chain = ','.join(parts)
+    
     if musikverein_room_effects and air_particle_layer:
-        _se = ('[str]aecho=0.65:0.75:11:0.019[side];' if echo_mode == 'jazz_vocal'
-               else '[str]aecho=0.65:0.75:11:0.031[side];')
-        _ce = ('[side]aecho=0.55:0.65:6:0.012[diff];' if echo_mode == 'jazz_vocal'
-               else '[side]aecho=0.55:0.65:6:0.02[diff];')
+        _se = ('[str]aecho=0.65:0.75:11:0.019[side];' if echo_mode == 'jazz_vocal' else '[str]aecho=0.65:0.75:11:0.031[side];')
+        _ce = ('[side]aecho=0.55:0.65:6:0.012[diff];' if echo_mode == 'jazz_vocal' else '[side]aecho=0.55:0.65:6:0.02[diff];')
+        
+        # Change 2: for the filter_complex route ([out]), add volume=-2dB at the final stage (after [premix])
         fc = (
-            f'[0:a]{main_chain}[main];'
-            + '[main]equalizer=f=250:t=q:w=1.3:g=0.4[str];'
-            + _se + _ce
-            + '[diff]volume=16dB[diffg];'
-            + 'anoisesrc=color=pink:amplitude=0.00040:r=48000:d=86400[air];'
-            + '[air]highpass=f=180,lowpass=f=8000[airband];'
-            + '[airband]volume=0.020,apulsator=hz=0.12:amount=0.08[airbed];'
-            + 'anoisesrc=color=brown:amplitude=0.00010:r=48000:d=86400[aud];'
-            + '[aud]highpass=f=220,volume=0.010[audience];'
-            + "[diffg][airbed][audience]amix=inputs=3:weights='1 0.012 0.005':normalize=0:duration=first[premix];"
-            + '[premix]alimiter=level_in=1.0:level_out=1.0:limit=0.92:attack=1:release=50[out]'
+            f'[0:a]{main_chain}[main];' +
+            '[main]equalizer=f=250:t=q:w=1.3:g=0.4[str];' +
+            _se + _ce +
+            '[diff]volume=16dB[diffg];' +
+            'anoisesrc=color=pink:amplitude=0.00040:r=48000:d=86400[air];' +
+            '[air]highpass=f=180,lowpass=f=8000[airband];' +
+            '[airband]volume=0.020,apulsator=hz=0.12:amount=0.08[airbed];' +
+            'anoisesrc=color=brown:amplitude=0.00010:r=48000:d=86400[aud];' +
+            '[aud]highpass=f=220,volume=0.010[audience];' +
+            "[diffg][airbed][audience]amix=inputs=3:weights='1 0.012 0.005':normalize=0:duration=first[premix];" +
+            '[premix]volume=-2dB,alimiter=level_in=1.0:level_out=1.0:limit=0.92:attack=1:release=50[out]'
         )
         return ['-filter_complex', fc, '-map', '[out]']
     else:
         return ['-af', main_chain]
+
 
 
 def _preset_vocal(gain_db, current_volume, eq_part, musikverein_room_effects,
@@ -9643,10 +9976,10 @@ def _preset_vocal(gain_db, current_volume, eq_part, musikverein_room_effects,
     parts += [
         'equalizer=f=40:t=q:w=0.75:g=2.2',
         'equalizer=f=60:t=q:w=0.8:g=3.0',
-        'equalizer=f=2500:t=q:w=2.0:g=-0.8',  # ヴァイオリンのザラつく芯を消す
-        'equalizer=f=3800:t=q:w=2.0:g=-0.6',  # ピアノのアタックの硬さ・濁りを取る
-        'equalizer=f=6200:t=q:w=3.0:g=-1.0',  # エキサイターのチリチリする開始点を叩く
-        'equalizer=f=7400:t=q:w=3.0:g=-1.2',  # 耳障りな高域の擦れ音をピンポイントで消す
+        'equalizer=f=2500:t=q:w=2.0:g=-0.8',  # Remove the gritty core of the violin
+        'equalizer=f=3800:t=q:w=2.0:g=-0.6',  # Remove the hardness / muddiness of piano attacks
+        'equalizer=f=6200:t=q:w=3.0:g=-1.0',  # Hit the starting point of the exciter's fizz
+        'equalizer=f=7400:t=q:w=3.0:g=-1.2',  # Pinpoint-remove the harsh high-frequency scraping
         'equalizer=f=80:t=q:w=0.85:g=2.6',
         'equalizer=f=110:t=q:w=0.9:g=-0.6',
         'equalizer=f=140:t=q:w=0.95:g=-0.6',
@@ -9759,10 +10092,10 @@ def _preset_jazz(gain_db, current_volume, eq_part, musikverein_room_effects,
     #parts += [
         #'equalizer=f=30:t=q:w=0.7:g=2.0',
         #'equalizer=f=40:t=q:w=0.75:g=2.2',
-        #'equalizer=f=2500:t=q:w=2.0:g=-0.8',  # ヴァイオリンのザラつく芯を消す
-        #'equalizer=f=3800:t=q:w=2.0:g=-0.6',  # ピアノのアタックの硬さ・濁りを取る
-        #'equalizer=f=6200:t=q:w=3.0:g=-1.0',  # エキサイターのチリチリする開始点を叩く
-        #'equalizer=f=7400:t=q:w=3.0:g=-1.2',  # 耳障りな高域の擦れ音をピンポイントで消す
+        #'equalizer=f=2500:t=q:w=2.0:g=-0.8',  # Remove the gritty core of the violin
+        #'equalizer=f=3800:t=q:w=2.0:g=-0.6',  # Remove the hardness / muddiness of piano attacks
+        #'equalizer=f=6200:t=q:w=3.0:g=-1.0',  # Hit the starting point of the exciter's fizz
+        #'equalizer=f=7400:t=q:w=3.0:g=-1.2',  # Pinpoint-remove the harsh high-frequency scraping
         #'equalizer=f=60:t=q:w=0.8:g=0.8',
         #'equalizer=f=80:t=q:w=0.85:g=0.2',
         #'equalizer=f=90:t=q:w=0.8:g=0.0',
@@ -9788,10 +10121,10 @@ def _preset_jazz(gain_db, current_volume, eq_part, musikverein_room_effects,
     parts += [
         'equalizer=f=30:t=q:w=0.7:g=0.8',     # 0.5 -> 0.8 超低域の空気感をわずかに戻す
         'equalizer=f=40:t=q:w=0.75:g=1.2',    # 1.0 -> 1.5 重低音のズッシリ感を強化
-        'equalizer=f=2500:t=q:w=2.0:g=-0.8',  # ヴァイオリンのザラつく芯を消す
-        'equalizer=f=3800:t=q:w=2.0:g=-0.6',  # ピアノのアタックの硬さ・濁りを取る
-        'equalizer=f=6200:t=q:w=3.0:g=-1.0',  # エキサイターのチリチリする開始点を叩く
-        'equalizer=f=7400:t=q:w=3.0:g=-1.2',  # 耳障りな高域の擦れ音をピンポイントで消す
+        'equalizer=f=2500:t=q:w=2.0:g=-0.8',  # Remove the gritty core of the violin
+        'equalizer=f=3800:t=q:w=2.0:g=-0.6',  # Remove the hardness / muddiness of piano attacks
+        'equalizer=f=6200:t=q:w=3.0:g=-1.0',  # Hit the starting point of the exciter's fizz
+        'equalizer=f=7400:t=q:w=3.0:g=-1.2',  # Pinpoint-remove the harsh high-frequency scraping
         'equalizer=f=60:t=q:w=0.8:g=0.8',     # 1.2 -> 2.5 キックの重量感と押し出しを大幅強化
         'equalizer=f=80:t=q:w=0.85:g=2.2',    # 0.5 -> 2.2 ベースの硬い芯とアタック感を強調
         'equalizer=f=90:t=q:w=0.8:g=1.8',     # 0.0 -> 1.5 押し出し感の輪郭をさらにハッキリと
@@ -9880,10 +10213,10 @@ def _preset_radio(gain_db, current_volume, eq_part, musikverein_room_effects,
     parts += [
         'equalizer=f=40:t=q:w=0.75:g=2.2',
         'equalizer=f=60:t=q:w=0.8:g=3.0',
-        'equalizer=f=2500:t=q:w=2.0:g=-0.8',  # ヴァイオリンのザラつく芯を消す
-        'equalizer=f=3800:t=q:w=2.0:g=-0.6',  # ピアノのアタックの硬さ・濁りを取る
-        'equalizer=f=6200:t=q:w=3.0:g=-1.0',  # エキサイターのチリチリする開始点を叩く
-        'equalizer=f=7400:t=q:w=3.0:g=-1.2',  # 耳障りな高域の擦れ音をピンポイントで消す
+        'equalizer=f=2500:t=q:w=2.0:g=-0.8',  # Remove the gritty core of the violin
+        'equalizer=f=3800:t=q:w=2.0:g=-0.6',  # Remove the hardness / muddiness of piano attacks
+        'equalizer=f=6200:t=q:w=3.0:g=-1.0',  # Hit the starting point of the exciter's fizz
+        'equalizer=f=7400:t=q:w=3.0:g=-1.2',  # Pinpoint-remove the harsh high-frequency scraping
         'equalizer=f=80:t=q:w=0.85:g=2.6',
         'equalizer=f=110:t=q:w=0.9:g=-0.6',
         'equalizer=f=140:t=q:w=0.95:g=-0.6',
@@ -9945,10 +10278,10 @@ def _preset_spatial(gain_db, current_volume, eq_part, musikverein_room_effects,
     parts += [
         'equalizer=f=40:t=q:w=0.75:g=2.2',
         'equalizer=f=60:t=q:w=0.8:g=3.0',
-        'equalizer=f=2500:t=q:w=2.0:g=-0.8',  # ヴァイオリンのザラつく芯を消す
-        'equalizer=f=3800:t=q:w=2.0:g=-0.6',  # ピアノのアタックの硬さ・濁りを取る
-        'equalizer=f=6200:t=q:w=3.0:g=-1.0',  # エキサイターのチリチリする開始点を叩く
-        'equalizer=f=7400:t=q:w=3.0:g=-1.2',  # 耳障りな高域の擦れ音をピンポイントで消す
+        'equalizer=f=2500:t=q:w=2.0:g=-0.8',  # Remove the gritty core of the violin
+        'equalizer=f=3800:t=q:w=2.0:g=-0.6',  # Remove the hardness / muddiness of piano attacks
+        'equalizer=f=6200:t=q:w=3.0:g=-1.0',  # Hit the starting point of the exciter's fizz
+        'equalizer=f=7400:t=q:w=3.0:g=-1.2',  # Pinpoint-remove the harsh high-frequency scraping
         'equalizer=f=80:t=q:w=0.85:g=2.6',
         'equalizer=f=110:t=q:w=0.9:g=-0.6',
         'equalizer=f=140:t=q:w=0.95:g=-0.6',
@@ -10131,10 +10464,10 @@ def _preset_calm(gain_db, current_volume, eq_part, musikverein_room_effects,
         # ── 基幹 EQ（Musikverein ベース、高域を穏やかに抑制） ──
         'equalizer=f=40:t=q:w=0.75:g=2.2',
         'equalizer=f=60:t=q:w=0.8:g=3.0',
-        'equalizer=f=2500:t=q:w=2.0:g=-0.8',  # ヴァイオリンのザラつく芯を消す
-        'equalizer=f=3800:t=q:w=2.0:g=-0.6',  # ピアノのアタックの硬さ・濁りを取る
-        'equalizer=f=6200:t=q:w=3.0:g=-1.0',  # エキサイターのチリチリする開始点を叩く
-        'equalizer=f=7400:t=q:w=3.0:g=-1.2',  # 耳障りな高域の擦れ音をピンポイントで消す
+        'equalizer=f=2500:t=q:w=2.0:g=-0.8',  # Remove the gritty core of the violin
+        'equalizer=f=3800:t=q:w=2.0:g=-0.6',  # Remove the hardness / muddiness of piano attacks
+        'equalizer=f=6200:t=q:w=3.0:g=-1.0',  # Hit the starting point of the exciter's fizz
+        'equalizer=f=7400:t=q:w=3.0:g=-1.2',  # Pinpoint-remove the harsh high-frequency scraping
         'equalizer=f=80:t=q:w=0.85:g=2.6',
         'equalizer=f=110:t=q:w=0.9:g=-0.6',
         'equalizer=f=140:t=q:w=0.95:g=-0.6',
@@ -10231,10 +10564,10 @@ def _preset_deep(gain_db, current_volume, eq_part, musikverein_room_effects,
         # ── 基幹 EQ（低域の重みを活かしつつ高域を抑制） ──
         'equalizer=f=40:t=q:w=0.75:g=2.2',
         'equalizer=f=60:t=q:w=0.8:g=3.0',
-        'equalizer=f=2500:t=q:w=2.0:g=-0.8',  # ヴァイオリンのザラつく芯を消す
-        'equalizer=f=3800:t=q:w=2.0:g=-0.6',  # ピアノのアタックの硬さ・濁りを取る
-        'equalizer=f=6200:t=q:w=3.0:g=-1.0',  # エキサイターのチリチリする開始点を叩く
-        'equalizer=f=7400:t=q:w=3.0:g=-1.2',  # 耳障りな高域の擦れ音をピンポイントで消す
+        'equalizer=f=2500:t=q:w=2.0:g=-0.8',  # Remove the gritty core of the violin
+        'equalizer=f=3800:t=q:w=2.0:g=-0.6',  # Remove the hardness / muddiness of piano attacks
+        'equalizer=f=6200:t=q:w=3.0:g=-1.0',  # Hit the starting point of the exciter's fizz
+        'equalizer=f=7400:t=q:w=3.0:g=-1.2',  # Pinpoint-remove the harsh high-frequency scraping
         'equalizer=f=80:t=q:w=0.85:g=2.6',
         'equalizer=f=110:t=q:w=0.9:g=-0.6',
         'equalizer=f=140:t=q:w=0.95:g=-0.6',
@@ -10793,6 +11126,15 @@ def play_one_track(track, show_controls=True):
                 current_gain_preset = 'classical'
             _gain_preset_auto_linked_jazz = False
 
+    # ★★★ Auto-apply sound-field presets (track memory > album memory > title rules > default) ★★★
+    #   Reflected into the SI EQ and wobble before the filter is built, so no [r] reload is needed.
+    try:
+        if _qjifield is not None:
+            _qjifield.on_track_start(track, _si_instance if SI_AVAILABLE else None, say=(terminal_print if SI_AVAILABLE else (lambda *_a, **_k: None)),
+                                          context={'dsp': dsp_mode_active, 'venue': current_dsp_venue, 'filter_preset': current_filter_preset})
+    except Exception:
+        pass
+
     terminal_print(f"\n▶ Now playing: {track.get('title', 'Unknown')}")
     terminal_print(f"   Artist: {track.get('artist', 'Unknown')}")
     if _profile_loaded:
@@ -10838,6 +11180,13 @@ def play_one_track(track, show_controls=True):
                 current_filter_preset = _db_fp
         _fp_label = FILTER_PRESET_LABELS.get(current_filter_preset, current_filter_preset)
         terminal_print(f"   🎛️  Filter: {_fp_label}  ✦auto-genre")
+        # ★ Without SI, the filter preset is only settled here. Re-evaluate the per-venue default (V7/V8 x Musikverein, etc.) now that it is known
+        try:
+            if _qjifield is not None:
+                _qjifield.on_track_start(track, None, say=terminal_print,
+                                              context={'dsp': dsp_mode_active, 'venue': current_dsp_venue, 'filter_preset': current_filter_preset})
+        except Exception:
+            pass
 
     if current_audio_preset != 'none':
         preset_names = {
@@ -10883,11 +11232,11 @@ def play_one_track(track, show_controls=True):
         terminal_print(f"   Mood: {color}{emoji} {mood_en}{reset}")
     
     if show_controls:
-        terminal_print(f"🎹 [r]Restart | [f]Play folder in order | [n]Next | [b]Prev | [i]Show image again | [o]Add to favorites | [ and ] Volume | [v]Volume ON/OFF | [0]Bypass/[1-6]Sound field (DSP) | [u/k/j/m]USB guard (all/AS/RT/status): {_usb_guard_summary()} | [q]Quit to menu")
+        terminal_print(f"🎹 [r]Restart | [f]Play folder in order | [n]Next | [b]Prev | [i]Show image again | [o]Add to favorites | [ and ] Volume | [v]Volume ON/OFF | [0]Bypass/[1-8]Sound field (DSP) | [u/k/j/m]USB guard (all/AS/RT/status): {_usb_guard_summary()} | [q]Quit to menu")
         _gp_labels = {'classical': 'Classical(0dB)', 'general': 'General(-1.5dB)', 'jazz_pop': 'Pop(-3.5dB)', 'loud': 'Loud(-5dB)'}
         terminal_print(f"🔊 [+][-]Output gain ({CURRENT_VOLUME:+d} dB) | [g]Input gain ({_gp_labels.get(current_gain_preset, current_gain_preset)}) | [c]Filter | [s]Save", end="")
         if SI_AVAILABLE:
-            terminal_print(" | [z]Feedback | [x]Preset | [a]Register album | [h]Hall | [p]Profile")
+            terminal_print(" | [z]Feedback | [x]Preset | [a]Register album | [h]Hall | [p]Profile | [e]Sound-field preset")
         else:
             terminal_print()
 
@@ -10924,7 +11273,19 @@ def play_one_track(track, show_controls=True):
     image_path = find_cover_image_safe(track_path)
     if image_path:
         feh_running = current_processes['feh'] and current_processes['feh'].poll() is None
-        if not feh_running or current_image_path != image_path:
+        # ★★★ Folder playback: swap only the composited image without closing feh (no desktop flash between tracks) ★★★
+        _cover_swapped = False
+        if (COVER_SEAMLESS_FOLDER and feh_running
+                and current_playback_mode == 'folder'
+                and current_image_path == COVER_WITH_INFO_PATH):
+            with info_display_lock:
+                _seamless_info = current_track_info.copy()
+            try:
+                if create_cover_with_info(image_path, _seamless_info) == COVER_WITH_INFO_PATH:
+                    _cover_swapped = True   # feh's --reload updates to the new image within a few hundred ms to 1 s
+            except Exception:
+                _cover_swapped = False      # On failure, relaunch feh as before
+        if not _cover_swapped and (not feh_running or current_image_path != image_path):
             if feh_running:
                 try:
                     current_processes['feh'].terminate()
@@ -11004,7 +11365,8 @@ def play_one_track(track, show_controls=True):
 
         # ★★★ Sonia Intelligence: SI EQデルタをeq_partに追加 ★★★
         if SI_AVAILABLE and _si_instance and _si_instance.current_params:
-            _si_eq_str = _si_get_eq_filters(_si_instance.current_params)
+            _si_eq_str = _si_get_eq_filters(_qjifield.params_with_scene(_si_instance.current_params)
+                                           if _qjifield is not None else _si_instance.current_params)
             if _si_eq_str:
                 eq_part = eq_part + _si_eq_str + ','
         
@@ -11281,7 +11643,9 @@ def _collect_audio_profile() -> dict:
                 'wet_override':      getattr(p, 'wet_override', None),
                 'pre_delay_override':getattr(p, 'pre_delay_override', None),
                 'side_ratio_override':getattr(p, 'side_ratio_override', None),
-                'eq':                dict(p.eq) if hasattr(p, 'eq') and p.eq else {},
+                'eq':                (_qjifield.eq_without_scene(dict(p.eq))
+                                      if (_qjifield is not None and hasattr(p, 'eq') and p.eq)
+                                      else (dict(p.eq) if hasattr(p, 'eq') and p.eq else {})),
                 'base_preset':       getattr(p, 'preset_name', None)
                                      or getattr(p, 'base_preset', None),
             }
@@ -11515,7 +11879,10 @@ def _redisplay_current_cover() -> bool:
     doesn't restart. Returns True if a cover was shown, False otherwise
     (e.g. no artwork found for this track).
     """
+    global current_image_path
+
     try:
+        # Identify the path of the playing track (current_playing_track first, otherwise from the display info)
         track_path = None
         if current_playing_track and current_playing_track.get('path'):
             track_path = current_playing_track.get('path')
@@ -11532,6 +11899,7 @@ def _redisplay_current_cover() -> bool:
         with info_display_lock:
             _ti_copy = current_track_info.copy()
 
+        # Close any existing feh window before showing it again (prevents duplicate windows)
         _feh = current_processes.get('feh')
         if _feh and _feh.poll() is None:
             try:
@@ -11564,9 +11932,27 @@ def _do_save_profile():
     [s]キー: 現在の全音響設定を音源プロファイルとして保存。
     曲単位 / アルバム単位をジャンル・タイトルから推奨し、ユーザーが選択する。
     """
+    global current_gain_preset, _gain_preset_auto_linked_jazz
+
     _si_display_event.clear()
     try:
         time.sleep(0.60)
+
+        # Fix: clear any "left-over jazz auto-promoted gain" before saving.
+        # current_gain_preset is a carried-over variable that is not reset between tracks;
+        # it is promoted to jazz_pop automatically only for the jazz preset, and is restored
+        # automatically only when switching back to a non-jazz preset (that rewind runs only
+        # on a normal track advance, not for tracks that have a saved profile).
+        # So if you press [s] on a classical track right after a jazz track, the stale
+        # jazz_pop used to be saved for the whole album, and that album then always played
+        # with the "Pop" gain from then on.
+        # Resolve just this inconsistency right before saving (a manual choice with the
+        # [g] key sets _gain_preset_auto_linked_jazz to False, so it is not overwritten).
+        if (_gain_preset_auto_linked_jazz
+                and current_filter_preset != 'jazz'
+                and current_gain_preset == 'jazz_pop'):
+            current_gain_preset = 'classical'
+            _gain_preset_auto_linked_jazz = False
 
         with info_display_lock:
             _ti = current_track_info.copy()
@@ -11592,8 +11978,14 @@ def _do_save_profile():
             print(f"│  Album : {(album or '---')[:43]:<43} │")
             print(f"│  Genre : {(genre or '---')[:43]:<43} │")
             print("├──────────────────────────────────────────────────────┤")
+            _gp_label_for_confirm = {
+                'classical': 'Classical (0 dB)',
+                'general':   'General (-1.5 dB)',
+                'jazz_pop':  'Pop (-3.5 dB)',
+                'loud':      'Loud (-5 dB)',
+            }.get(profile['gain_preset'], profile['gain_preset'])
             print(f"│  Filter        : {_fp_label:<38} │")
-            print(f"│  Input gain    : {profile['gain_preset']:<38} │")
+            print(f"│  Input gain    : {_gp_label_for_confirm:<38} │")
             print(f"│  Output gain   : {CURRENT_VOLUME:+d} dB{'':<35} │")
             print(f"│  Musikverein   : {'ON' if profile['musikverein_room_effects'] else 'OFF':<38} │")
             print(f"│  Air Layer     : {'ON' if profile['air_particle_layer'] else 'OFF':<38} │")
@@ -12034,8 +12426,8 @@ def keyboard_listener():
                     # ★★★ [m] (alias: y) Show the current USB noise-guard state (no toggling) ★★★
                     terminal_print(f"\n🔌 USB noise-guard state: {_usb_guard_summary()}  (AS = autosuspend guard / RT = real-time priority)")
 
-                elif key in ('0', '1', '2', '3', '4', '5', '6'):
-                    # ★★★ [1]-[6] switch the DSP mode directly, in place ★★★
+                elif key in ('0', '1', '2', '3', '4', '5', '6', '7', '8'):
+                    # ★★★ [0]=DSP bypass, [1]-[8] switch the DSP venue directly, in place ★★★
                     if dsp_mode_active:
                         if (toggle_dsp_bypass() if key == '0' else switch_dsp_venue(key)):
                             # ★ Playback (ffmpeg->aplay) is never touched — only the cover-art
@@ -12051,25 +12443,54 @@ def keyboard_listener():
                     # 画面クリア後にコントロール表示を再描画
                     try:
                         time.sleep(0.1)
-                        terminal_print(f"\n🎹 [r]Restart | [f]Folder | [n]Next | [b]Prev | [i]Show image | [o]Favorite | [ and ] Volume | [v]Vol ON/OFF | [0]Bypass/[1-6]DSP | [u/k/j/m]USB guard: {_usb_guard_summary()} | [q]Menu")
+                        terminal_print(f"\n🎹 [r]Restart | [f]Folder | [n]Next | [b]Prev | [i]Show image | [o]Favorite | [ and ] Volume | [v]Vol ON/OFF | [0]Bypass/[1-8]DSP | [u/k/j/m]USB guard: {_usb_guard_summary()} | [q]Menu")
                         _gp_l = {'classical': 'Classical(0dB)', 'general': 'General(-1.5dB)', 'jazz_pop': 'Pop(-3.5dB)', 'loud': 'Loud(-5dB)'}
                         terminal_print(f"🔊 [+][-]Output gain ({CURRENT_VOLUME:+d} dB) | [g]Gain ({_gp_l.get(current_gain_preset, current_gain_preset)}) | [c]Filter | [s]Save", end="")
                         if SI_AVAILABLE:
-                            terminal_print(" | [z]Feedback | [x]Preset | [a]Album | [h]Hall | [p]Profile")
+                            terminal_print(" | [z]Feedback | [x]Preset | [a]Album | [h]Hall | [p]Profile | [e]Sound-field preset")
                         else:
                             terminal_print()
                     except:
                         pass
                     # ── 画面クリア後にキーガイドを再表示 ──
                     time.sleep(0.1)
-                    terminal_print(f"\n🎹 [r]Restart | [f]Folder | [n]Next | [b]Prev | [i]Show image | [o]Favorite | [ and ] Volume | [v]Vol ON/OFF | [0]Bypass/[1-6]DSP | [u/k/j/m]USB guard: {_usb_guard_summary()} | [q]Menu")
+                    terminal_print(f"\n🎹 [r]Restart | [f]Folder | [n]Next | [b]Prev | [i]Show image | [o]Favorite | [ and ] Volume | [v]Vol ON/OFF | [0]Bypass/[1-8]DSP | [u/k/j/m]USB guard: {_usb_guard_summary()} | [q]Menu")
                     _fp = FILTER_PRESET_LABELS.get(current_filter_preset, current_filter_preset)
                     _gp_l2 = {'classical': 'Classical(0dB)', 'general': 'General(-1.5dB)', 'jazz_pop': 'Pop(-3.5dB)', 'loud': 'Loud(-5dB)'}
                     terminal_print(f"🔊 [+][-]Output gain ({CURRENT_VOLUME:+d} dB) | [g]Gain ({_gp_l2.get(current_gain_preset, current_gain_preset)}) | [c]Filter ({_fp}) | [s]Save", end="")
                     if SI_AVAILABLE:
-                        terminal_print(" | [z]Feedback | [x]Preset | [a]Album | [h]Hall | [p]Profile")
+                        terminal_print(" | [z]Feedback | [x]Preset | [a]Album | [h]Hall | [p]Profile | [e]Sound-field preset")
                     else:
                         terminal_print()
+
+                elif key == 'e':
+                    # ★★★ [e] -> [instrument / vocal / wobble / volume-link / memory (m) / current settings (?)] sound-field presets ★★★
+                    #   Adjusts wobble_v7/v8 without restarting them (v7/v8 only). Instrument EQ takes effect from the next track / [r] reload.
+                    try:
+                        if _qjifield is None:
+                            terminal_print("\n⚠️ qji_field_ctl.py (sound-field presets) was not found. Put it in ~/qji/camilladsp_test/ or install it with the QjiDSP installer")
+                        else:
+                            if not dsp_mode_active:
+                                terminal_print("\n⚠️ Not in DSP mode, so the wobble side has no effect (instrument EQ only)")
+                            elif current_dsp_venue not in ('7', '8'):
+                                terminal_print("\nℹ️ You are not on v7/v8, so the wobble side is not applied (switch to [7] or [8])")
+                            _qjifield.handle_two_stage_key(_si_instance if SI_AVAILABLE else None, say=terminal_print)
+                            # ★ Once saved, return to the cover-art display like [s] does (audio keeps playing) ★
+                            if _qjifield.consume_saved():
+                                with terminal_io_lock:
+                                    print("\n  🖼️  Returning to the cover-art display...")
+                                    sys.stdout.flush()
+                                time.sleep(0.4)
+                                if not _redisplay_current_cover():
+                                    with terminal_io_lock:
+                                        print("  ℹ️  No cover image found (playback continues)")
+                                        sys.stdout.flush()
+                            try:
+                                termios.tcflush(sys.stdin, termios.TCIFLUSH)
+                            except Exception:
+                                pass
+                    except Exception as _e:
+                        terminal_print(f"\n⚠️ Sound-field preset error: {_e}")
     except Exception as e:
         terminal_print(f"Keyboard listener error: {e}")
     finally:
@@ -12327,8 +12748,19 @@ def play_tracks_gapless(tracks, start_index=0):
             if os.path.exists(first_track_path):
                 original_sample_rate = get_sample_rate(first_track_path)
 
+        # ★★★ Pre-check for format mismatches (diagnostic warning only; playback is not stopped) ★★★
+        _check_gapless_batch_format_mismatch(batch_tracks, original_sample_rate)
+
         # Concatファイルを作成
         concat_file = create_concat_file_for_gapless(batch_tracks, temp_dir)
+
+        # ★★★ Sound-field presets: gapless runs through a single filter, so the first track's settings apply to the whole batch ★★★
+        try:
+            if _qjifield is not None and batch_tracks:
+                _qjifield.on_track_start(batch_tracks[0], _si_instance if SI_AVAILABLE else None, say=terminal_print,
+                                              context={'dsp': dsp_mode_active, 'venue': current_dsp_venue, 'filter_preset': current_filter_preset})
+        except Exception:
+            pass
 
         # ★★★ アップサンプリング設定に応じて出力サンプリングレートを決定 ★★★
         if upsampling_target_rate > 0:
@@ -12347,7 +12779,8 @@ def play_tracks_gapless(tracks, start_index=0):
 
         # ★★★ Sonia Intelligence: SI EQデルタをeq_partに追加 ★★★
         if SI_AVAILABLE and _si_instance and _si_instance.current_params:
-            _si_eq_str = _si_get_eq_filters(_si_instance.current_params)
+            _si_eq_str = _si_get_eq_filters(_qjifield.params_with_scene(_si_instance.current_params)
+                                           if _qjifield is not None else _si_instance.current_params)
             if _si_eq_str:
                 eq_part = eq_part + _si_eq_str + ','
         
@@ -12433,10 +12866,20 @@ def play_tracks_gapless(tracks, start_index=0):
         print("=" * 60)
         
         # FFmpegとaplayをパイプで接続
+        # ★ Don't throw ffmpeg's stderr into DEVNULL; keep it in a log file
+        #   (so that when the concat demuxer terminates abnormally because of a format
+        #    mismatch or similar, the actual error can be checked afterwards)
+        _gapless_ffmpeg_log_path = f'/tmp/qji_gapless_ffmpeg_{os.getpid()}.log'
+        try:
+            _gapless_ffmpeg_log = open(_gapless_ffmpeg_log_path, 'w', encoding='utf-8', errors='replace')
+        except Exception:
+            _gapless_ffmpeg_log = subprocess.DEVNULL
+            _gapless_ffmpeg_log_path = None
+
         ffmpeg_proc = subprocess.Popen(
             ffmpeg_cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL
+            stderr=_gapless_ffmpeg_log
         )
 
         _gain_relay_stop = threading.Event()
@@ -12497,6 +12940,11 @@ def play_tracks_gapless(tracks, start_index=0):
                 _gain_relay_stop.set()
                 ffmpeg_proc.terminate()
                 aplay_proc.terminate()
+                try:
+                    if _gapless_ffmpeg_log is not subprocess.DEVNULL:
+                        _gapless_ffmpeg_log.close()
+                except Exception:
+                    pass
                 return gapless_current_index
             
             if next_track_requested:
@@ -12505,6 +12953,11 @@ def play_tracks_gapless(tracks, start_index=0):
                 _gain_relay_stop.set()
                 ffmpeg_proc.terminate()
                 aplay_proc.terminate()
+                try:
+                    if _gapless_ffmpeg_log is not subprocess.DEVNULL:
+                        _gapless_ffmpeg_log.close()
+                except Exception:
+                    pass
                 return min(gapless_current_index + 1, len(tracks) - 1)
             
             if prev_track_requested:
@@ -12513,12 +12966,43 @@ def play_tracks_gapless(tracks, start_index=0):
                 _gain_relay_stop.set()
                 ffmpeg_proc.terminate()
                 aplay_proc.terminate()
+                try:
+                    if _gapless_ffmpeg_log is not subprocess.DEVNULL:
+                        _gapless_ffmpeg_log.close()
+                except Exception:
+                    pass
                 return max(0, gapless_current_index - 1)
         
         # プロセスの終了待ち
         ffmpeg_proc.wait()
         aplay_proc.wait()
-        
+
+        try:
+            if _gapless_ffmpeg_log is not subprocess.DEVNULL:
+                _gapless_ffmpeg_log.close()
+        except Exception:
+            pass
+
+        # ★ If ffmpeg had terminated abnormally, it used to be treated the same as
+        #   "all tracks finished" (the returncode was never checked).
+        #   Distinguish the two here and, on a crash, show that and the log location.
+        if ffmpeg_proc.returncode not in (0, None, -15, -9):
+            print(f"\n⚠️  Gapless playback ended abnormally part-way through "
+                  f"(around track {gapless_current_index + 1}/{len(tracks)}, "
+                  f"ffmpeg exit code: {ffmpeg_proc.returncode})")
+            if _gapless_ffmpeg_log_path and os.path.exists(_gapless_ffmpeg_log_path):
+                try:
+                    with open(_gapless_ffmpeg_log_path, 'r', encoding='utf-8', errors='replace') as f:
+                        _tail = f.readlines()[-15:]
+                    if _tail:
+                        print("   --- Latest ffmpeg log ---")
+                        for line in _tail:
+                            print(f"   {line.rstrip()}")
+                        print(f"   (full log: {_gapless_ffmpeg_log_path})")
+                except Exception:
+                    pass
+            return gapless_current_index
+
         # 全曲再生完了
         return len(tracks)
     
@@ -12526,6 +13010,11 @@ def play_tracks_gapless(tracks, start_index=0):
         print(f"⚠️ Gapless playback error: {e}")
         import traceback
         traceback.print_exc()
+        try:
+            if '_gapless_ffmpeg_log' in locals() and _gapless_ffmpeg_log is not subprocess.DEVNULL:
+                _gapless_ffmpeg_log.close()
+        except Exception:
+            pass
         return start_index
     
     finally:
@@ -13046,8 +13535,8 @@ def show_splash_screen():
 
 
 def dsp_venue_menu():
-    """★ Home-screen menu to switch the DSP venue (v1-v6).
-    Uses the same switch_dsp_venue() as the in-playback [1]-[6] keys,
+    """★ Home-screen menu to switch the DSP venue (V1-V8).
+    Uses the same switch_dsp_venue() as the in-playback [1]-[8] keys,
     so the DAC is not re-selected - only the venue changes.
     Streaming sources (radio, Qobuz, etc.) simply play through whichever venue is chosen here."""
     global current_dsp_venue
@@ -13057,15 +13546,15 @@ def dsp_venue_menu():
     while True:
         print("\n🎛️ Switch DSP venue")
         print("=" * 60)
-        for _k in ('1', '2', '3', '4', '5', '6'):
+        for _k in ('1', '2', '3', '4', '5', '6', '7', '8'):
             _mark = "  ◀ current" if current_dsp_venue == _k else ""
-            print(f"  {_k}. {DSP_VENUE_LABELS.get(_k, 'v' + _k)}{_mark}")
+            print(f"  {_k}. {DSP_VENUE_LABELS.get(_k, 'V' + _k)}{_mark}")
         print("  0. Back")
         print("=" * 60)
-        _sel = input("\nSelect venue (1-6, 0=back): ").strip()
+        _sel = input("\nSelect venue (1-8, 0=back): ").strip()
         if _sel in ('', '0', 'q'):
             return
-        if _sel not in ('1', '2', '3', '4', '5', '6'):
+        if _sel not in ('1', '2', '3', '4', '5', '6', '7', '8'):
             print("⚠️ Invalid choice")
             continue
         if _sel == current_dsp_venue:
@@ -13147,7 +13636,7 @@ def interactive_mode():
         print("  AP. 📡 AirPlay receiver (from iPhone / Mac)")  # ★★★ AirPlay ★★★
         print("  DL. 📻 UPnP/DLNA receiver (BubbleUPnP etc.)")  # ★★★ UPnP/DLNA ★★★
         if dsp_mode_active:
-            print(f"  D. 🎛️ Switch DSP venue (v1-v6): now {DSP_VENUE_LABELS.get(current_dsp_venue, '-')}")
+            print(f"  D. 🎛️ Switch DSP venue (V1-V8): now {DSP_VENUE_LABELS.get(current_dsp_venue, '-')}")
         print("  Q. Quit")
         print("=" * 60)
         print("💡 Press [q] during playback to return to this menu")
@@ -13934,7 +14423,7 @@ def interactive_mode():
                     output_device=output_device,
                 )
 
-            elif choice == 'd':  # ★★★ Switch DSP venue (v1-v6) ★★★
+            elif choice == 'd':  # ★★★ Switch DSP venue (V1-V8) ★★★
                 dsp_venue_menu()
                 continue
 
@@ -14045,6 +14534,8 @@ if __name__ == "__main__":
                 '4': f'{_HOME}/qjidsp_backup_v4/spatial_final.yml',
                 '5': f'{_HOME}/qjidsp_backup_v5/spatial_final.yml',
                 '6': f'{_HOME}/qjidsp_backup_v6/spatial_final.yml',
+                '7': f'{_HOME}/qjidsp_backup_v7/spatial_final.yml',
+                '8': f'{_HOME}/qjidsp_backup_v8/spatial_final.yml',
             }
             _wobble_map = {
                 '1': f'{_HOME}/camilladsp_test/wobble_v1.py',
@@ -14053,10 +14544,12 @@ if __name__ == "__main__":
                 '4': f'{_HOME}/camilladsp_test/wobble_v4.py',
                 '5': f'{_HOME}/camilladsp_test/wobble_v5.py',
                 '6': f'{_HOME}/camilladsp_test/wobble_v5_harmonics_hp.py',
+                '7': f'{_HOME}/camilladsp_test/wobble_v7.py',
+                '8': f'{_HOME}/camilladsp_test/wobble_v8.py',
             }
             # ★ Loopback選択時はDSPモードの使用が前提のため、「DSPなしで起動」は
             #   選択肢として提示しない（音が出ない矛盾した状態を防ぐ）。
-            #   1〜6のいずれかを選ぶまでループする。
+            #   1〜8のいずれかを選ぶまでループする。
             _dsp_choice = ''
             while _dsp_choice not in _yml_map:
                 print("\n" + "=" * 60)
@@ -14068,10 +14561,24 @@ if __name__ == "__main__":
                 print("  4) v4 Natural tone (moving)  — simple, washitsu-style panning")
                 print("  5) v5 Harmonics mode        — violin resonance / shakuhachi-style overtones")
                 print("  6) v6 Harmonics mode (headphones) — tuned for closed/open headphones")
+                print("  7) v7 Harmonic Hall mode  — v5-based hall. Not muffled, easy to listen to")
+                print("  8) v8 Tangible Hall       — v5-based hall. Denser reverberance, strong physical presence")
                 print("=" * 60)
-                _dsp_choice = input("Select DSP mode (1/2/3/4/5/6) → ").strip()
+                # ★ Venues that aren't installed (YAML or wobble missing) are explained and re-asked instead of crashing
+                _unavail = {_k: [_p for _p in (_yml_map[_k], _wobble_map[_k]) if not os.path.exists(_p)]
+                            for _k in _yml_map}
+                if any(_unavail.values()):
+                    print("  Note: these venues can't be selected because required files are missing: "
+                          + ", ".join(f"v{_k}" for _k, _m in _unavail.items() if _m))
+                _dsp_choice = input("Select DSP mode (1/2/3/4/5/6/7/8) → ").strip()
                 if _dsp_choice not in _yml_map:
-                    print("⚠️ Please select 1–6 (DSP startup is required when Loopback is selected)")
+                    print("⚠️ Please select 1–8 (DSP startup is required when Loopback is selected)")
+                elif _unavail.get(_dsp_choice):
+                    print(f"\n❌ Required files for v{_dsp_choice} were not found:")
+                    for _p in _unavail[_dsp_choice]:
+                        print(f"   - {_p}")
+                    print("   Install them with the latest QjiDSP installer, or choose another venue.")
+                    _dsp_choice = ''
             if True:
                 # ★ {HOME}プレースホルダを実際のホームパスへ展開してからコピーする
                 #   （単純な shutil.copy だと {HOME} が文字列のまま残り、
@@ -14108,7 +14615,12 @@ if __name__ == "__main__":
                 _time.sleep(1.0)
                 print(f"🎛️  DSP v{_dsp_choice} started")
                 dsp_mode_active = True
-                current_dsp_venue = _dsp_choice  # ★ Initial value for the cover-art badge and [1-6] switching
+                current_dsp_venue = _dsp_choice  # ★ Recorded for later [1]-[8] key switching and the cover-art badge
+                try:
+                    if _qjifield is not None:
+                        _qjifield.set_venue(_dsp_choice)
+                except Exception:
+                    pass
                 # ★ CamillaDSP/wobbleはここで一度だけ起動する常駐プロセス。
                 #   プログラム終了時にのみ確実に停止させる（途中のcleanup_processes()では止めない）
                 atexit.register(shutdown_dsp)

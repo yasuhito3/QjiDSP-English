@@ -6,7 +6,7 @@ In addition to the original Qji code, this repository includes the following ext
 
 ### `Musikvereinsaal_48k_tail.wav` (reverb impulse response)
 
-This is the IR (impulse response) file referenced by the `real_hall_L` / `real_hall_R` filters in `spatial_final_v1-v6.yml`, modeling the reverb of the Musikverein (Vienna's Musikvereinsaal concert hall).
+This is the IR (impulse response) file referenced by the `real_hall_L` / `real_hall_R` filters in `spatial_final_v1-v8.yml`, modeling the reverb of the Musikverein (Vienna's Musikvereinsaal concert hall).
 
 **Likely source**: an IR named "Musikvereinsaal" in [Voxengo's Free Reverb Impulse Responses](https://www.voxengo.com/impulses/)
 pack (distributed by Aleksey Vaneev) has an exactly matching name. That pack was originally distributed as 44.1kHz/16-bit WAV,

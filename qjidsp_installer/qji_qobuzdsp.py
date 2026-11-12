@@ -7,8 +7,9 @@ qji.py から Q キーで呼び出される。
   [n]次  [b]前  [q]メニューへ
   [g]ゲイン切替  [G]ギャップレス ON/OFF  [w]APL ON/OFF  [c]プリセット選択
   [+]/[=]音量+1dB  [-]音量-1dB
-  [0] DSP bypass (pass-through) ON/OFF  [1]-[6] DSP venue switch (DSP mode only; uses qji.py's functions)
+  [0] DSP bypass (pass-through) ON/OFF  [1]-[8] DSP venue switch (DSP mode only; uses qji.py's functions)
   [u]/[k]/[j] toggle the USB noise guard (all / autosuspend / RT priority)  [m] show state (y also works) (uses qji.py's functions)
+  [e] sound-field presets  [x] SI acoustic presets  [r] reload the current track from the start (uses qji.py's functions)
   [s]音響設定を保存
 """
 
@@ -87,11 +88,11 @@ def _is_dsp_mode_active() -> bool:
 
 def _switch_dsp_venue_via_main(key: str) -> Optional[bool]:
     """
-    Switch the DSP venue (v1-v6) through switch_dsp_venue() of the caller (qji.py = __main__).
+    Switch the DSP venue (v1-v8) through switch_dsp_venue() of the caller (qji.py = __main__).
     Returns True = switched / False = failed / None = already on that venue (nothing done)
     """
     main_mod = sys.modules.get('__main__')
-    # [0] = toggle DSP bypass (pass-through), [1]-[6] = switch venue
+    # [0] = toggle DSP bypass (pass-through), [1]-[8] = switch venue
     fn = getattr(main_mod, 'toggle_dsp_bypass' if key == '0' else 'switch_dsp_venue', None)
     if not callable(fn):
         print('  ⚠ DSP switch function not found (was this launched from qji.py?)')
@@ -127,6 +128,179 @@ def _usb_guard_action(key: str) -> None:
         elif new_state is False:
             print(f'\n🔌 {labels[key]}: OFF')
     print(f'🔌 USB noise-guard state: {_usb_guard_summary_via_main()}  (AS = autosuspend guard / RT = real-time priority)')
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ★ Sound-field presets ([e] -> ...) for Qobuz
+#   Uses _qjifield (qji_field_ctl.py) of qji.py (__main__) as is.
+#   - Wobble / volume-link / wider / closer: reflected into the wobble immediately via the control file (independent of the playback source)
+#   - Instrument EQ (violin beautifully, etc.): combined into ffmpeg's eq_part -> takes effect from the next track or an [r] reload
+#   - Track / album memory: Qobuz tracks have no real file path, so a pseudo path qobuz/<album name>/<track ID> is used
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _field_mod():
+    """Return _qjifield of qji.py (__main__), or None if absent."""
+    try:
+        return getattr(sys.modules.get('__main__'), '_qjifield', None)
+    except Exception:
+        return None
+
+
+def _field_track_dict(t: dict) -> dict:
+    """Convert Qobuz track info into the form on_track_start() accepts (with a pseudo path)."""
+    def _safe(x):
+        x = re.sub(r'[\\/:\x00-\x1f]+', '_', str(x or '')).strip(' .')
+        return x[:80] or 'unknown'
+    album = _safe(t.get('album')) if t.get('album') else 'single'
+    tid = _safe(t.get('track_id'))
+    return {
+        'path':      f'qobuz/{album}/{tid}',
+        'title':     t.get('title', '') or '',
+        'album':     t.get('album', '') or '',
+        'performer': t.get('artist', '') or '',
+        'composer':  '',
+        'genre':     '',
+        'filename':  '',
+    }
+
+
+# -- Sonia Intelligence ([x] acoustic preset menu) for Qobuz ---------------------
+#   SI corrections accumulate in _si_instance.current_params.eq and are combined into the same eq_part as the instrument EQ.
+#   Qobuz tracks do not go through SI's track analysis (which assumes local files), so at the start of a new track it is reset to neutral (no EQ),
+#   so the EQ of a previously played local track does not leak in. Adjustments made in [x] are kept while the same track is reloaded.
+_si_last_tid = {'tid': None}
+
+
+def _si_obj():
+    """The SI instance of qji.py (__main__). None if SI is disabled."""
+    try:
+        m = sys.modules.get('__main__')
+        if not getattr(m, 'SI_AVAILABLE', False):
+            return None
+        return getattr(m, '_si_instance', None)
+    except Exception:
+        return None
+
+
+def _si_reset_for_track(t: dict, force: bool = False) -> None:
+    si = _si_obj()
+    if si is None:
+        return
+    tid = t.get('track_id')
+    if not force and _si_last_tid['tid'] == tid and getattr(si, 'current_params', None) is not None:
+        return   # reload of the same track: keep the values adjusted in [x]
+    _si_last_tid['tid'] = tid
+    try:
+        from filter_builder import params_from_preset
+        p = params_from_preset('default')
+        if hasattr(p, 'eq'):
+            p.eq = {}            # do not change Qobuz's default sound (only the EQ added via [x])
+        si.current_params = p
+    except Exception:
+        cp = getattr(si, 'current_params', None)
+        if cp is not None and hasattr(cp, 'eq'):
+            try:
+                cp.eq = {}
+            except Exception:
+                pass
+
+
+def _si_menu_action(state: dict) -> bool:
+    """Called when [x] is pressed (in raw mode, from the listener thread). Opens qji.py's own acoustic preset menu as is.
+    Returns True if the menu was opened (-> the current track is restarted from the beginning to apply it)."""
+    si = _si_obj()
+    fn = getattr(sys.modules.get('__main__'), '_si_do_preset_menu', None)
+    if si is None or not callable(fn):
+        sys.stdout.write('\r\n  ⚠ Sonia Intelligence is not available ([x] works only when SI is enabled)\r\n')
+        sys.stdout.flush()
+        return False
+    t = state.get('current_track') or {}
+    if getattr(si, 'current_params', None) is None:
+        _si_reset_for_track(t, force=True)
+    if getattr(si, 'current_params', None) is None:
+        sys.stdout.write('\r\n  ⚠ Could not initialize the SI parameters\r\n')
+        sys.stdout.flush()
+        return False
+    try:
+        fn()   # show the menu -> enter a number -> apply (input via /dev/tty; returns to raw on exit)
+    except Exception as e:
+        sys.stdout.write(f'\r\n  ⚠ SI menu error: {e}\r\n')
+        sys.stdout.flush()
+        return False
+    # Remember the confirmed SI EQ as the fixed value for this track (Qobuz pseudo path); a reload no longer cancels it
+    try:
+        fc = _field_mod()
+        if fc is not None and t:
+            fc.set_si_eq_override(_field_track_dict(t)['path'],
+                                  dict(getattr(si.current_params, 'eq', None) or {}))
+    except Exception:
+        pass
+    return True
+
+
+def _field_on_track_start(t: dict, state: dict) -> None:
+    """Call at the start of a track (before the filter is built). Settings are decided in the order memory > title rules > per-sound-field default."""
+    fc = _field_mod()
+    if fc is None:
+        return
+    try:
+        _si_reset_for_track(t)
+        main_mod = sys.modules.get('__main__')
+        fc.on_track_start(
+            _field_track_dict(t), _si_obj(), say=print,
+            context={'dsp': _is_dsp_mode_active(),
+                     'venue': getattr(main_mod, 'current_dsp_venue', None),
+                     'filter_preset': state.get('filter_preset', 'musikverein')})
+    except Exception as e:
+        print(f'  ⚠ Sound-field preset error: {e}')
+
+
+def _field_scene_eq_str() -> str:
+    """Return the instrument EQ of the current sound-field preset as a string for eq_part (with a trailing comma). '' if none."""
+    fc = _field_mod()
+    if fc is None:
+        return ''
+    try:
+        fn = getattr(sys.modules.get('__main__'), '_si_get_eq_filters', None)
+        if not callable(fn):
+            return ''
+        si = _si_obj()
+        eq = fn(fc.params_with_scene(getattr(si, 'current_params', None) if si else None))
+        return (eq + ',') if eq else ''
+    except Exception:
+        return ''
+
+
+def _field_key_action(state: dict) -> bool:
+    """Called when [e] is pressed (in raw mode). Waits for the next key and applies the sound-field preset.
+    Returns True if a memory was stored (-> return to the cover-art display)."""
+    fc = _field_mod()
+    if fc is None:
+        print('\r\n  ⚠ qji_field_ctl.py was not found (put it in ~/qji/camilladsp_test/ or install it with the QjiDSP installer)\r')
+        return False
+
+    def _say(msg=''):
+        # Output with CRLF so lines do not drift into a staircase even in raw mode
+        sys.stdout.write(str(msg).replace('\r\n', '\n').replace('\n', '\r\n') + '\r\n')
+        sys.stdout.flush()
+
+    try:
+        if not _is_dsp_mode_active():
+            _say('\nℹ️ Not in DSP mode, so the wobble side has no effect (instrument EQ only)')
+        elif getattr(sys.modules.get('__main__'), 'current_dsp_venue', None) not in ('7', '8'):
+            _say('\nℹ️ You are not on V7/V8, so the wobble side is not applied (switch with [7] or [8])')
+        eq_changed = fc.handle_two_stage_key(_si_obj(), say=_say)
+        if eq_changed:
+            _say('   ℹ️ In Qobuz, press [r] to restart the current track and apply the instrument EQ right away')
+        saved = False
+        try:
+            saved = bool(fc.consume_saved())
+        except Exception:
+            pass
+        return saved
+    except Exception as e:
+        _say(f'\n⚠ Sound-field preset error: {e}')
+        return False
+
 
 _incognito_proc: Optional[subprocess.Popen] = None
 _incognito_tmp_dir: Optional[str] = None
@@ -490,6 +664,7 @@ def _download_jacket(cover_url: str) -> Optional[str]:
 # feh プロセス（デスクトップ表示用）
 _feh_proc      = None
 _feh_hidden    = False   # ESC で非表示にした状態
+_feh_composite_active = False   # whether feh is showing the "composited image file with track info" with --reload
 
 # プレイリスト再生状態（ブラウザUIへのポーリング用）
 _PLAYLIST_STATUS: dict = {
@@ -505,7 +680,7 @@ _PLAYLIST_STATUS: dict = {
 
 def _feh_hide():
     """feh を終了して画像を非表示にする（ESC キー）"""
-    global _feh_proc, _feh_hidden
+    global _feh_proc, _feh_hidden, _feh_composite_active
     if _feh_proc and _feh_proc.poll() is None:
         try:
             _feh_proc.terminate()
@@ -514,11 +689,12 @@ def _feh_hide():
             pass
     _feh_proc   = None
     _feh_hidden = True
+    _feh_composite_active = False
 
 
 def _feh_show(track_info: dict = None, jacket_path: str = None):
     """feh を起動して画像を再表示する（i キー）"""
-    global _feh_proc, _feh_hidden
+    global _feh_proc, _feh_hidden, _feh_composite_active
     _feh_hidden = False
 
     path = jacket_path or (str(_JACKET_TMP) if _JACKET_TMP.exists() else None)
@@ -537,7 +713,13 @@ def _feh_show(track_info: dict = None, jacket_path: str = None):
                 except Exception:
                     pass
             _feh_proc = show_fn(path, track_info)
+            # Record whether qji.py managed to show the composited image with track info (fixed path, with --reload).
+            # If so, the next track can be handled by just swapping the image file, without closing feh.
+            _comp = getattr(_qji, 'COVER_WITH_INFO_PATH', None)
+            _feh_composite_active = bool(
+                _feh_proc and _comp and getattr(_qji, 'current_image_path', None) == _comp)
         else:
+            _feh_composite_active = False
             if _feh_proc and _feh_proc.poll() is None:
                 try:
                     _feh_proc.terminate(); _feh_proc.wait(timeout=1)
@@ -553,6 +735,29 @@ def _feh_show(track_info: dict = None, jacket_path: str = None):
     except Exception as e:
         sys.stdout.write(f'\r  ⚠ Cover art error: {e}        \n')
         sys.stdout.flush()
+
+def _feh_swap_composite(track_info: dict, jacket_path: str) -> bool:
+    """Swap only the composited image file with track info, without closing feh (so the desktop never shows between tracks).
+
+    feh keeps showing the same file with --reload, so when the file is replaced by the new track's
+    image the display updates automatically. Returns True if the swap succeeded,
+    False if the conditions are not met or it fails (the caller then relaunches feh as before).
+    """
+    if not (_feh_proc and _feh_proc.poll() is None
+            and _feh_composite_active and not _feh_hidden):
+        return False
+    try:
+        import __main__ as _qji
+        if not getattr(_qji, 'COVER_SEAMLESS_FOLDER', False):
+            return False
+        comp      = getattr(_qji, 'COVER_WITH_INFO_PATH', None)
+        create_fn = getattr(_qji, 'create_cover_with_info', None)
+        if not (comp and create_fn):
+            return False
+        return create_fn(jacket_path, track_info) == comp
+    except Exception:
+        return False
+
 
 def _update_now_playing(track: dict, state: dict, elapsed: int = 0):
     """
@@ -612,7 +817,9 @@ def _update_now_playing(track: dict, state: dict, elapsed: int = 0):
         # デスクトップ: 曲情報付きジャケット（新曲に変わったら自動表示）
         # ESC で非表示中（_feh_hidden=True）の場合は表示しない
         if jacket_path and not _feh_hidden:
-            _feh_show(track_info=track_info, jacket_path=jacket_path)
+            # ★ First try swapping only the image without closing feh. If that is not possible, relaunch it as before.
+            if not _feh_swap_composite(track_info, jacket_path):
+                _feh_show(track_info=track_info, jacket_path=jacket_path)
 
         # now-playing サーバー用に image_path も更新
         if hasattr(_qji, 'current_image_path'):
@@ -632,7 +839,8 @@ def _update_now_playing(track: dict, state: dict, elapsed: int = 0):
 
 def _clear_now_playing():
     """再生終了時: 情報クリア + feh 終了 + ANSI オーバーレイ停止"""
-    global _feh_proc
+    global _feh_proc, _feh_composite_active
+    _feh_composite_active = False
     # feh を終了
     if _feh_proc and _feh_proc.poll() is None:
         try:
@@ -1436,9 +1644,9 @@ def _key_listener_thread(state: dict, fd_orig_settings):
                             pass
                         tty.setraw(fd)
 
-                elif cl in ('0', '1', '2', '3', '4', '5', '6'):
-                    # ★ [0]=toggle DSP bypass (pass-through), [1]-[6]=switch the DSP venue in place. Audio (ffmpeg->aplay) keeps running
-                    #   and the track is not restarted (same behaviour as the [1]-[6] keys in qji.py local playback).
+                elif cl in ('0', '1', '2', '3', '4', '5', '6', '7', '8'):
+                    # ★ [0]=toggle DSP bypass (pass-through), [1]-[8]=switch the DSP venue in place. Audio (ffmpeg->aplay) keeps running
+                    #   and the track is not restarted (same behaviour as the [1]-[8] keys in qji.py local playback).
                     # Leave raw mode during the switch (~4 s) so printed lines are not mangled.
                     termios.tcsetattr(fd, termios.TCSANOW, fd_orig_settings)
                     if not _is_dsp_mode_active():
@@ -1447,7 +1655,7 @@ def _key_listener_thread(state: dict, fd_orig_settings):
                     else:
                         result = _switch_dsp_venue_via_main(cl)
                         if result is None:
-                            print(f'\r  ℹ Already on v{cl}')
+                            print(f'\r  ℹ Already on V{cl}')
                     try:
                         termios.tcflush(fd, termios.TCIFLUSH)   # discard keys buffered during the switch
                     except Exception:
@@ -1459,6 +1667,36 @@ def _key_listener_thread(state: dict, fd_orig_settings):
                             track_info=state.get('current_track_info'),
                             jacket_path=state.get('current_jacket_path'),
                         )
+
+                elif cl == 'e':
+                    # ★ [e] -> [w/n/o/v/b/c/...] sound-field presets (same operation as qji.py local playback).
+                    #   Read the next key while staying in raw mode (returning to cooked mode would wait for Enter).
+                    _saved_ok = _field_key_action(state)
+                    try:
+                        termios.tcflush(fd, termios.TCIFLUSH)
+                    except Exception:
+                        pass
+                    if _saved_ok:
+                        # After a memory is stored, return to the cover-art display (audio keeps playing)
+                        sys.stdout.write('\r\n  🖼️  Returning to the cover-art display...\r\n')
+                        sys.stdout.flush()
+                        time.sleep(0.4)
+                        _feh_show(
+                            track_info=state.get('current_track_info'),
+                            jacket_path=state.get('current_jacket_path'),
+                        )
+
+                elif cl == 'x':
+                    # ★ [x] Sonia Intelligence acoustic presets (same menu as qji.py local playback)
+                    if _si_menu_action(state):
+                        _replay_flag = True   # apply the adjusted EQ to the current track right away (restart it from the beginning)
+
+                elif cl == 'r':
+                    # ★ Restart the current track from the beginning (apply settings such as the instrument EQ, which otherwise take effect on the next track / reload, right now)
+                    _replay_flag = True
+                    termios.tcsetattr(fd, termios.TCSANOW, fd_orig_settings)
+                    print('\r  🔄 Reloading...        ', flush=True)
+                    tty.setraw(fd)
 
                 elif cl == 'a':
                     # 自動ジャンル検出モード（手動ロックを解除して再適用）
@@ -1748,8 +1986,14 @@ def _play_one_gapless(stream_url: str, sample_rate: int,
 
 
 def _play_list(client: QobuzClient, tracks: List[dict],
-               start: int, build_filter_func, state: dict):
-    """トラックリストを順番に再生。次トラックの URL はバックグラウンドで先読みする。"""
+               start: int, build_filter_func, state: dict,
+               keep_cover: bool = False):
+    """Play the track list in order. The next track's URL is prefetched in the background.
+
+    keep_cover=True: do not close the cover-art screen (feh) at the end. When playing several albums / playlists
+    in a row, this keeps the desktop from showing at album boundaries.
+    (Call the last one with keep_cover=False, or have the caller run _clear_now_playing().)
+    """
 
     def _get_filter_args(sample_rate: int = 44100):
         import __main__ as _qji
@@ -1763,7 +2007,7 @@ def _play_list(client: QobuzClient, tracks: List[dict],
                 state.get('tinnitus', False),
                 state.get('musikverein', True),
                 state.get('loudness', ''),
-                state.get('eq_part', ''),
+                state.get('eq_part', '') + _field_scene_eq_str(),   # ★ combine the instrument EQ of the sound-field preset
                 state.get('volume', 12),
                 state.get('air_layer', True),
                 echo_mode=state.get('echo_mode', 'classical'),
@@ -1865,6 +2109,7 @@ def _play_list(client: QobuzClient, tracks: List[dict],
                 threading.Thread(target=_prefetch, args=(tid,), daemon=True).start()
 
     i = start
+    _si_last_tid['tid'] = None   # do not carry [x] adjustments over into a new playlist
 
     while 0 <= i < len(tracks):
         t = tracks[i]
@@ -1875,7 +2120,7 @@ def _play_list(client: QobuzClient, tracks: List[dict],
         print(f'\n  ♫  {t.get("artist", "")} — {t.get("title", "")}{dur}')
         gapless_ind = ' 🔗GL' if state.get('gapless') else ''
         q_hint = '[q]Next PL' if state.get('playlist_queue_mode') else '[q]Stop'
-        print(f'     [n]Next [b]Prev {q_hint} [g]Gain [G]Gapless{gapless_ind} [w]APL [c]Preset [a]Auto [+/-]Vol [0]Bypass/[1-6]Venue [u/k/j/m]USB:{_usb_guard_summary_via_main()} [s]Save [i]Image [ESC]Stop')
+        print(f'     [n]Next [b]Prev {q_hint} [g]Gain [G]Gapless{gapless_ind} [w]APL [c]Preset [a]Auto [+/-]Vol [0]Bypass/[1-8]Venue [e]Field preset [x]SI [r]Reload [u/k/j/m]USB:{_usb_guard_summary_via_main()} [s]Save [i]Image [ESC]Stop')
 
         tid = t['track_id']
         if tid not in cached_url:
@@ -1902,6 +2147,9 @@ def _play_list(client: QobuzClient, tracks: List[dict],
 
         state['current_track'] = t
         _update_now_playing(t, state)
+
+        # ★ Sound-field presets: decide memory > title rules > per-sound-field default before building the filter
+        _field_on_track_start(t, state)
 
         filter_args = _get_filter_args(sample_rate)
 
@@ -1932,7 +2180,8 @@ def _play_list(client: QobuzClient, tracks: List[dict],
         elif outcome == 'prev':
             i = max(0, i - 1)
 
-    _clear_now_playing()
+    if not keep_cover:
+        _clear_now_playing()
     # ギャップレスモードの後始末
     if state.get('gapless'):
         # ① まずパイプを閉じる → _pb_run の os.write() ブロックが EPIPE で解除される
@@ -2403,7 +2652,8 @@ def _handle_playlist_request(client: QobuzClient, build_filter_func,
             state['manual_preset_locked'] = False
             _apply_auto_preset(album, state)
 
-            result = _play_list(client, tracks, 0, build_filter_func, state)
+            result = _play_list(client, tracks, 0, build_filter_func, state,
+                                keep_cover=(idx < total))
             _restore_terminal()
 
             queue_items[idx-1]['done'] = True
@@ -2422,6 +2672,7 @@ def _handle_playlist_request(client: QobuzClient, build_filter_func,
         print(f'\n  🎵 Playlist playback complete')
 
     finally:
+        _clear_now_playing()   # make sure the cover-art screen is closed even on an interruption (a double call is harmless)
         # 必ずバーを停止してスクロール領域を元に戻す
         bar.stop()
         _restore_terminal()
@@ -2573,7 +2824,8 @@ def _handle_playlist_queue_request(client: QobuzClient, build_filter_func,
             state['current_playlist_id']   = pid
             state['current_playlist_name'] = name
             state['current_album']         = None
-            result = _play_list(client, tracks, 0, build_filter_func, state)
+            result = _play_list(client, tracks, 0, build_filter_func, state,
+                                keep_cover=(pl_idx < total_pl))
             _restore_terminal()
 
             if result == 'quit':
@@ -2591,6 +2843,7 @@ def _handle_playlist_queue_request(client: QobuzClient, build_filter_func,
 
     finally:
         state['playlist_queue_mode'] = False
+        _clear_now_playing()   # make sure the cover-art screen is closed even on an interruption (a double call is harmless)
         _restore_terminal()
 
 def _handle_browser_request(client: QobuzClient, build_filter_func,

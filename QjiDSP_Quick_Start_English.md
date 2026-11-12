@@ -32,7 +32,7 @@ QjiDSP is designed around a Linux Audio environment using ALSA.
 
 ## 3. Select a DSP mode
 
-When a Loopback output is selected, QjiDSP offers six DSP modes:
+When a Loopback output is selected, QjiDSP offers eight DSP modes:
 
 - **v1 — Rich Hall (Static)**
 - **v2 — Rich Hall (Dynamic)**
@@ -40,6 +40,8 @@ When a Loopback output is selected, QjiDSP offers six DSP modes:
 - **v4 — Natural Material (Dynamic)**
 - **v5 — Harmonic Mode**
 - **v6 — Harmonic Mode (Headphones)**
+- **v7 — Harmonic Hall Mode**
+- **v8 — Tangible Hall**
 
 For a first experiment:
 
